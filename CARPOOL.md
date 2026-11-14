@@ -92,10 +92,10 @@ OpenAI 兼容端点，并把 `keyword_blocking_mode` 调回 `keyword_and_api`—
 
 | 规则 | 匹配 | 车友看到 |
 |---|---|---|
-| carpool-mask-5xx | 500/502/503/504/529 | 502 「上游服务暂时不可用…」 |
-| carpool-mask-429 | 429 | 429 「用车需求较高…」（保留 429 让客户端正常退避重试） |
-| carpool-mask-auth | 401/402/403 | 502 「上游通道维护中…」（绝不暴露车主账号状态） |
-| carpool-mask-400 | 400/404/413/422 | 原状态码 + 「请求被上游拒绝…」（客户端可据此修自己的参数） |
+| carpool-mask-5xx | 500/502/503/504/529 | 502 「上游服务暂时不可用，请稍后重试；若持续失败请联系车主。」 |
+| carpool-mask-429 | 429 | 502 「上游服务暂时不可用，请稍后重试；若持续失败请联系车主。」 |
+| carpool-mask-auth | 401/402/403 | 502 「上游服务暂时不可用，请稍后重试；若持续失败请联系车主。」 |
+| carpool-mask-400 | 400/404/413/422 | 502 「上游服务暂时不可用，请稍后重试；若持续失败请联系车主。」 |
 
 所有规则的 `skip_monitoring=false`：真实上游错误（含脱敏后的响应体）始终记录在车主的
 运维看板，车友端拿到的只有 custom_message。
@@ -145,7 +145,7 @@ OpenAI 兼容端点，并把 `keyword_blocking_mode` 调回 `keyword_and_api`—
   - 历史上下文、以及以 `assistant`/`model`/`tool`/`tool_result`/`functionResponse`/`function_call_output` 结尾的 Agent 工具循环轮次不会触发关键词拦截（保留上游设计，避免工具循环误伤）。
   - 本地关键词已覆盖最新一轮 `user` 消息（含空文本附带系统指令场景）、Responses `instructions`、Anthropic 顶层 `system`、Gemini `systemInstruction`/`system_instruction` 及末尾 `system`/`developer` 项；匹配为大小写不敏感的子串匹配（`strings.Contains`），在后台追加短关键词时注意避免误伤正常语义。
 - 上游报错伪装边界：
-  - 400 类确定性错误默认保留状态码（客户端需要知道参数错在哪）。若想连 400 也完全统一成 502，在后台把 `carpool-mask-400` 的「透传状态码」关掉并填 502 即可。
+  - 所有预置 `carpool-mask-*` 规则默认统一改写为 `502` 与同一条通用文案，不对外区分上游错误类型；若后续希望放开 `429` 或 `400` 类原状态码，可在后台对应规则中开启「透传状态码」。
   - 流式请求中上游**已开始输出后**的中断无法伪装（SSE 已发出 200），种子规则只覆盖响应头之前（或仅发出 keepalive 心跳未输出正文前）的失败——这也是上游所有反代的一致行为。
   - 空响应体且带 HTTP 状态码的上游失败现已可命中按状态码匹配的规则（含原生路由及 `/v1/responses`、`/v1/chat/completions` 兼容路由 failover 耗尽）；无 HTTP 状态码且无 `LastFailoverErr` 的本地调度/连接失败仍走通用 502 兜底文案。
   - OpenAI 凭据/访问态拒绝、过载降级（`IsOpenAICapacityShed`）、兼容模型不存在 400、静默拒绝以及 `cyber_policy` 硬阻断会在透传规则之前返回；Responses WebSocket 模式则使用内置脱敏关闭文案，不读取 `error_passthrough_rules`。

@@ -9,8 +9,8 @@
 --      ContentModerationService.Check 命中并返回 403，不产生任何上游调用，
 --      也不依赖任何外部审核 API（无需配置 api_keys）。
 --   3. 上游报错伪装走 ErrorPassthroughService 兜底规则：所有平台命中后，
---      5xx 与 401/402/403 统一改写为 502 通用文案，429 与 400 类保留原状态码并
---      改写文案；真实上游错误只留在车主的管理端运维看板里。
+--      4xx/5xx 全部统一改写为 502 与同一条通用文案，不区分错误类型；
+--      真实上游错误只留在车主的管理端运维看板里。
 --   4. 全部语句幂等（settings 使用 ON CONFLICT DO NOTHING；error_passthrough_rules
 --      在 name 上无唯一约束，故使用 WHERE NOT EXISTS 按 name 防重），可在已有
 --      实例上重复执行且不覆盖管理员已有的手工配置。
@@ -89,12 +89,11 @@ ON CONFLICT (key) DO NOTHING;
 -- ErrorPassthroughRule 表（backend/internal/model/error_passthrough_rule.go）：
 --   - platforms='[]'  → 匹配所有平台（openai/anthropic/gemini/antigravity/...）
 --   - match_mode=any + error_codes  → 仅按状态码匹配
---   - passthrough_code=false + response_code=502 → 将 5xx/鉴权类改写为 502；
---     429 与 400 类设 passthrough_code=true 保留原状态码，仅改写文案
---   - passthrough_body=false + custom_message → 永不透传上游真实报错文案
+--   - passthrough_code=false + response_code=502 → 所有命中的上游错误统一改写为 502
+--   - passthrough_body=false + custom_message → 全部使用同一条通用文案，永不透传上游真实报错
 --   - skip_monitoring=false → 车主运维看板仍记录真实上游错误（含脱敏 body），
---     车友端永远只看到 custom_message。
--- 优先级数字越小越先匹配；多条规则覆盖常见上游故障类别。
+--     车友端永远只看到同一套 502 与通用提示。
+-- 优先级数字越小越先匹配；保留按类别拆分规则，方便车主后续按需在后台单独放开。
 -- 注意：error_passthrough_rules 表在 name 上没有 UNIQUE 约束，不能依赖
 -- ON CONFLICT DO NOTHING 防重，必须用 WHERE NOT EXISTS 保证幂等。
 INSERT INTO error_passthrough_rules (
@@ -123,10 +122,10 @@ FROM (
             TRUE, 10,
             '[429]'::jsonb, '[]'::jsonb, 'any',
             '[]'::jsonb,
-            TRUE, NULL::integer, FALSE,
-            '当前时段用车需求较高，已达上游速率限制，请稍后重试。',
+            FALSE, 502, FALSE,
+            '上游服务暂时不可用，请稍后重试；若持续失败请联系车主。',
             FALSE,
-            '上游 429 → 保留 429 状态码但改写文案'
+            '上游 429 → 统一 502 通用文案'
         ),
         (
             'carpool-mask-auth',
@@ -134,19 +133,19 @@ FROM (
             '[401,402,403]'::jsonb, '[]'::jsonb, 'any',
             '[]'::jsonb,
             FALSE, 502, FALSE,
-            '上游通道维护中，请稍后重试。',
+            '上游服务暂时不可用，请稍后重试；若持续失败请联系车主。',
             FALSE,
-            '上游凭据/账单类错误 → 502，绝不暴露车主账号状态'
+            '上游凭据/账单类错误 → 统一 502 通用文案'
         ),
         (
             'carpool-mask-400',
             TRUE, 20,
             '[400,404,413,422]'::jsonb, '[]'::jsonb, 'any',
             '[]'::jsonb,
-            TRUE, NULL::integer, FALSE,
-            '请求被上游拒绝：请检查模型名、参数格式或请求体大小后重试。',
+            FALSE, 502, FALSE,
+            '上游服务暂时不可用，请稍后重试；若持续失败请联系车主。',
             FALSE,
-            '确定性请求错误 → 保留状态码，改写为不泄露上游细节的通用文案'
+            '确定性请求错误 → 统一 502 通用文案'
         )
 ) AS v (
     name, enabled, priority, error_codes, keywords, match_mode,

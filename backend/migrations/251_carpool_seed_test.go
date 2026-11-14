@@ -283,33 +283,18 @@ func TestCarpoolSeed_ErrorPassthroughRules(t *testing.T) {
 		require.False(t, rule.SkipMonitoring, "rule %s keeps ops records for the owner", rule.Name)
 	}
 
-	// 语义断言：凭据类(401/402/403)与 5xx 一律改写为 502，
-	// 429/400 类保留状态码但改写文案。
+	// 语义断言：所有伪装规则一律改写为 502 与同一条通用文案，不区分错误类型。
+	const unifiedMessage = "上游服务暂时不可用，请稍后重试；若持续失败请联系车主。"
 	byName := map[string]*model.ErrorPassthroughRule{}
 	for _, r := range rules {
 		byName[r.Name] = r
+		require.False(t, r.PassthroughCode, "rule %s must normalize status code to 502", r.Name)
+		require.NotNil(t, r.ResponseCode, "rule %s must define response_code", r.Name)
+		require.Equal(t, 502, *r.ResponseCode, "rule %s must return 502", r.Name)
+		require.Equal(t, unifiedMessage, *r.CustomMessage, "rule %s must use unified masking message", r.Name)
 	}
-	mask5xx := byName["carpool-mask-5xx"]
-	require.NotNil(t, mask5xx)
-	require.Equal(t, []int{500, 502, 503, 504, 529}, mask5xx.ErrorCodes)
-	require.False(t, mask5xx.PassthroughCode)
-	require.NotNil(t, mask5xx.ResponseCode)
-	require.Equal(t, 502, *mask5xx.ResponseCode)
-
-	maskAuth := byName["carpool-mask-auth"]
-	require.NotNil(t, maskAuth)
-	require.Equal(t, []int{401, 402, 403}, maskAuth.ErrorCodes)
-	require.False(t, maskAuth.PassthroughCode)
-	require.NotNil(t, maskAuth.ResponseCode)
-	require.Equal(t, 502, *maskAuth.ResponseCode)
-
-	mask429 := byName["carpool-mask-429"]
-	require.NotNil(t, mask429)
-	require.Equal(t, []int{429}, mask429.ErrorCodes)
-	require.True(t, mask429.PassthroughCode, "429 keeps upstream status code")
-
-	mask400 := byName["carpool-mask-400"]
-	require.NotNil(t, mask400)
-	require.Equal(t, []int{400, 404, 413, 422}, mask400.ErrorCodes)
-	require.True(t, mask400.PassthroughCode, "4xx request errors keep upstream status code")
+	require.Equal(t, []int{500, 502, 503, 504, 529}, byName["carpool-mask-5xx"].ErrorCodes)
+	require.Equal(t, []int{401, 402, 403}, byName["carpool-mask-auth"].ErrorCodes)
+	require.Equal(t, []int{429}, byName["carpool-mask-429"].ErrorCodes)
+	require.Equal(t, []int{400, 404, 413, 422}, byName["carpool-mask-400"].ErrorCodes)
 }
