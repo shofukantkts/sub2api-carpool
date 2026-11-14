@@ -165,8 +165,9 @@ func (s *OpenAIGatewayService) ForwardEmbeddings(
 			writeOpenAIEmbeddingsError(c, status, errType, errMsg)
 			return nil, fmt.Errorf("upstream returned status %d (passthrough rule matched)", resp.StatusCode)
 		}
-		writeOpenAIEmbeddingsUpstreamResponse(c, resp, respBody, s.responseHeaderFilter)
-		return nil, fmt.Errorf("upstream returned status %d", resp.StatusCode)
+		s.recordOpenAINonFailoverHTTPError(c, account, resp, respBody)
+		writeCarpoolMaskedUpstreamError(c)
+		return nil, fmt.Errorf("upstream returned status %d (response masked)", resp.StatusCode)
 	}
 
 	respBody, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)

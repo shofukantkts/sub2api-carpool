@@ -2,6 +2,7 @@ package handler
 
 import (
 	"crypto/sha256"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -68,6 +69,23 @@ func (h *OpenAIGatewayHandler) checkSecurityAuditStage(c *gin.Context, reqLog *z
 func runSecurityAudit(c *gin.Context, reqLog *zap.Logger, coordinator *securityaudit.Coordinator, legacy *service.ContentModerationService, apiKey *service.APIKey, subject middleware2.AuthSubject, protocol, model string, body []byte, stage string) *securityaudit.Decision {
 	if c == nil || c.Request == nil {
 		return nil
+	}
+	if err := service.ValidateJSONNoDuplicateKeys(body); errors.Is(err, service.ErrDuplicateJSONKeys) {
+		return &securityaudit.Decision{
+			Kind:           securityaudit.DecisionBlock,
+			HTTPStatus:     http.StatusBadRequest,
+			ErrorCode:      "invalid_request_error",
+			ClientMessage:  service.DuplicateJSONKeysMessage,
+			AllowNextStage: false,
+			Legacy: &securityaudit.LegacyDecision{
+				Allowed:    false,
+				Blocked:    true,
+				StatusCode: http.StatusBadRequest,
+				ErrorCode:  "invalid_request_error",
+				Message:    service.DuplicateJSONKeysMessage,
+				Action:     service.ContentModerationActionError,
+			},
+		}
 	}
 	cacheCompletion := cachesSecurityAuditCompletion(stage)
 	if cacheCompletion {

@@ -218,7 +218,7 @@ func TestCarpoolFailoverExhausted_EmptyBodyMatchesStatusRule(t *testing.T) {
 		require.Contains(t, rec.Body.String(), "上游服务暂时不可用，请稍后重试")
 	})
 
-	t.Run("gateway_responses_credential_failure_not_overridden", func(t *testing.T) {
+	t.Run("gateway_responses_credential_failure_is_overridden", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(rec)
 		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil))
@@ -235,7 +235,8 @@ func TestCarpoolFailoverExhausted_EmptyBodyMatchesStatusRule(t *testing.T) {
 		}, false)
 
 		require.Equal(t, http.StatusBadGateway, rec.Code)
-		require.Contains(t, rec.Body.String(), service.AntigravityCredentialRejectedClientMessage)
+		require.Contains(t, rec.Body.String(), "上游服务暂时不可用，请稍后重试")
+		require.NotContains(t, rec.Body.String(), service.AntigravityCredentialRejectedClientMessage)
 	})
 
 	t.Run("gateway_cc_failover_exhausted_matches_rule", func(t *testing.T) {
@@ -379,6 +380,65 @@ func TestCarpoolNonFailoverAlphaSearchResponsesFallbackUsesPassthroughRule(t *te
 	require.NotContains(t, rec.Body.String(), "Unprocessable Entity")
 }
 
+func TestCarpoolNonFailoverOpenAINativeErrorsWithoutMatchingRuleAreMasked(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const secret = "provider-only diagnostic: account=secret"
+
+	t.Run("embeddings unknown status", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/embeddings", bytes.NewReader(nil))
+
+		h := newCarpoolOpenAIForwardService(&carpoolHTTPUpstreamStub{
+			statusCode: http.StatusTeapot,
+			body:       []byte(`{"error":{"message":"` + secret + `"}}`),
+		})
+		account := &service.Account{
+			ID:       304,
+			Platform: service.PlatformOpenAI,
+			Type:     service.AccountTypeAPIKey,
+			Credentials: map[string]any{
+				"api_key":  "sk-test",
+				"base_url": "https://compat.example",
+			},
+		}
+
+		result, err := h.ForwardEmbeddings(context.Background(), c, account, []byte(`{"model":"text-embedding-3-small","input":"hello"}`), "")
+		require.Error(t, err)
+		require.Nil(t, result)
+		require.Equal(t, http.StatusBadGateway, rec.Code)
+		require.Equal(t, service.CarpoolMaskedUpstreamClientMessage, gjson.Get(rec.Body.String(), "error.message").String())
+		require.NotContains(t, rec.Body.String(), secret)
+	})
+
+	t.Run("alpha search unknown status", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/alpha/search", bytes.NewReader(nil))
+
+		h := newCarpoolOpenAIForwardService(&carpoolHTTPUpstreamStub{
+			statusCode: http.StatusTeapot,
+			body:       []byte(`{"error":{"message":"` + secret + `"}}`),
+		})
+		account := &service.Account{
+			ID:       305,
+			Platform: service.PlatformOpenAI,
+			Type:     service.AccountTypeAPIKey,
+			Credentials: map[string]any{
+				"api_key":  "sk-test",
+				"base_url": "https://compat.example",
+			},
+		}
+
+		result, err := h.ForwardAlphaSearch(context.Background(), c, account, []byte(`{"model":"gpt-5.6-sol","commands":{"search_query":[{"q":"news"}]}}`))
+		require.NoError(t, err)
+		require.Nil(t, result)
+		require.Equal(t, http.StatusBadGateway, rec.Code)
+		require.Equal(t, service.CarpoolMaskedUpstreamClientMessage, gjson.Get(rec.Body.String(), "error.message").String())
+		require.NotContains(t, rec.Body.String(), secret)
+	})
+}
+
 func TestCarpoolAnthropicOpenAIAccountFailoverUsesPassthroughRule(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()
@@ -399,6 +459,46 @@ func TestCarpoolAnthropicOpenAIAccountFailoverUsesPassthroughRule(t *testing.T) 
 	require.Equal(t, "upstream_error", gjson.Get(rec.Body.String(), "error.type").String())
 	require.Equal(t, "上游服务暂时不可用，请稍后重试", gjson.Get(rec.Body.String(), "error.message").String())
 	require.NotContains(t, rec.Body.String(), "secret upstream detail")
+}
+
+func TestCarpoolCredentialFailoverUsesAuthPassthroughBeforeInternalMessage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rule := newCarpoolMaskStatusRule(http.StatusUnauthorized, "上游服务暂时不可用，请稍后重试；若持续失败请联系管理员。")
+	rule.Name = "carpool-mask-auth"
+
+	t.Run("chat completions", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(nil))
+		h := &GatewayHandler{errorPassthroughService: service.NewErrorPassthroughService(&errorPassthroughRepoStub{rules: []*model.ErrorPassthroughRule{rule}}, nil)}
+		h.handleCCFailoverExhaustedWithPlatform(c, &service.UpstreamFailoverError{
+			StatusCode: http.StatusUnauthorized,
+			Stage:      service.GatewayFailureStageAccountAuth,
+			Scope:      service.GatewayFailureScopeAccount,
+			Reason:     service.AntigravityCredentialRejectedReason,
+		}, service.PlatformOpenAI, false)
+
+		require.Equal(t, http.StatusBadGateway, rec.Code)
+		require.Contains(t, rec.Body.String(), "上游服务暂时不可用，请稍后重试；若持续失败请联系管理员。")
+		require.NotContains(t, rec.Body.String(), service.AntigravityCredentialRejectedClientMessage)
+	})
+
+	t.Run("native openai responses", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil))
+		h := &OpenAIGatewayHandler{errorPassthroughService: service.NewErrorPassthroughService(&errorPassthroughRepoStub{rules: []*model.ErrorPassthroughRule{rule}}, nil)}
+		h.handleFailoverExhausted(c, &service.UpstreamFailoverError{
+			StatusCode: http.StatusUnauthorized,
+			Stage:      service.GatewayFailureStageAccountAuth,
+			Scope:      service.GatewayFailureScopeAccount,
+			Reason:     service.AntigravityCredentialRejectedReason,
+		}, false)
+
+		require.Equal(t, http.StatusBadGateway, rec.Code)
+		require.Contains(t, rec.Body.String(), "上游服务暂时不可用，请稍后重试；若持续失败请联系管理员。")
+		require.NotContains(t, rec.Body.String(), service.AntigravityCredentialRejectedClientMessage)
+	})
 }
 
 func TestCarpoolChatFailoverAfterHeartbeatWritesTerminalError(t *testing.T) {

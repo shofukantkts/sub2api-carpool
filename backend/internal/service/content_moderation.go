@@ -41,6 +41,8 @@ const (
 	ContentModerationActionError        = "error"
 	ContentModerationActionCyberPolicy  = "cyber_policy" // cyber_policy 硬阻断的风控日志 action（封号计数排除按此值过滤）
 
+	OpenAIEmbeddingsIntegerTokenInputMessage = "integer token inputs are not permitted when content moderation is enabled"
+
 	contentModerationKeywordCategory = "keyword"
 
 	ContentModerationKeywordModeKeywordOnly   = "keyword_only"
@@ -55,6 +57,7 @@ const (
 	ContentModerationProtocolOpenAIResponses   = "openai_responses"
 	ContentModerationProtocolOpenAIChat        = "openai_chat_completions"
 	ContentModerationProtocolOpenAIEmbeddings  = "openai_embeddings"
+	ContentModerationProtocolOpenAIAlphaSearch = "openai_alpha_search"
 	ContentModerationProtocolGemini            = "gemini"
 	ContentModerationProtocolOpenAIImages      = "openai_images"
 	ContentModerationProtocolTypeSafeSystemOne = "typesafe_systemone"
@@ -928,6 +931,31 @@ func (s *ContentModerationService) Check(ctx context.Context, input ContentModer
 			"model_filter_type", cfg.ModelFilter.Type,
 			"configured_models", cfg.ModelFilter.Models)
 		return allow, nil
+	}
+	if input.Protocol == ContentModerationProtocolOpenAIEmbeddings && OpenAIEmbeddingsInputContainsIntegerTokens(input.Body) {
+		if cfg.Mode == ContentModerationModePreBlock {
+			s.recordPreBlockSyncMetric(0, ContentModerationActionError)
+		}
+		slog.Warn("content_moderation.reject_integer_token_input",
+			"user_id", input.UserID,
+			"api_key_id", input.APIKeyID,
+			"group_id", contentModerationLogGroupID(input.GroupID),
+			"endpoint", input.Endpoint,
+			"protocol", input.Protocol)
+		scores := map[string]float64{"input_format": 1.0}
+		log := s.buildLog(input, cfg, ContentModerationActionError, true, "input_format", 1.0, scores, OpenAIEmbeddingsIntegerTokenInputMessage, nil, nil, "integer token input cannot be moderated locally")
+		s.enqueueRecord(input, cfg, log, "", false, false)
+		return &ContentModerationDecision{
+			Allowed:         false,
+			Blocked:         true,
+			Flagged:         true,
+			Message:         OpenAIEmbeddingsIntegerTokenInputMessage,
+			StatusCode:      http.StatusBadRequest,
+			HighestCategory: "input_format",
+			HighestScore:    1.0,
+			CategoryScores:  scores,
+			Action:          ContentModerationActionError,
+		}, nil
 	}
 	if cfg.Mode == ContentModerationModePreBlock {
 		if cfg.KeywordBlockingMode != ContentModerationKeywordModeAPIOnly && len(cfg.BlockedKeywords) > 0 {

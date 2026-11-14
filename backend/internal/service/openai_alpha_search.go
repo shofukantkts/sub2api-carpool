@@ -128,6 +128,9 @@ func (s *OpenAIGatewayService) ForwardAlphaSearch(ctx context.Context, c *gin.Co
 			c.JSON(status, gin.H{"error": gin.H{"type": errType, "message": errMsg}})
 			return nil, nil
 		}
+		s.recordOpenAINonFailoverHTTPError(c, account, resp, respBody)
+		writeCarpoolMaskedUpstreamError(c)
+		return nil, nil
 	}
 
 	if !account.IsShadow() {
@@ -223,6 +226,9 @@ func (s *OpenAIGatewayService) forwardAlphaSearchViaResponsesWebSearch(
 			c.JSON(status, gin.H{"error": gin.H{"type": errType, "message": errMsg}})
 			return nil, nil
 		}
+		s.recordOpenAINonFailoverHTTPError(c, account, resp, respBody)
+		writeCarpoolMaskedUpstreamError(c)
+		return nil, nil
 	}
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {

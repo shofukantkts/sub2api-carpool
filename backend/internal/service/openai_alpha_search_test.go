@@ -244,7 +244,7 @@ func TestForwardAlphaSearchPATBackfillsMissingChatGPTAccountMetadata(t *testing.
 	require.Equal(t, OpenAIAuthModePersonalAccessToken, account.Credentials["auth_mode"])
 }
 
-func TestForwardAlphaSearchAPIKeyMapsModelAndPassesThroughError(t *testing.T) {
+func TestForwardAlphaSearchAPIKeyMapsModelAndMasksUnmatchedError(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	body := []byte(`{"id":"search-session","model":"gpt-5.6-sol","commands":{"search_query":[{"q":"news"}]}}`)
 	recorder := httptest.NewRecorder()
@@ -275,10 +275,11 @@ func TestForwardAlphaSearchAPIKeyMapsModelAndPassesThroughError(t *testing.T) {
 	result, err := service.ForwardAlphaSearch(context.Background(), c, account, body)
 
 	require.NoError(t, err)
-	// 上游错误透传不是一次成功的搜索：不返回 result、不产生按次计费。
+	// 未命中透传规则时也不得把上游错误体暴露给客户端。
 	require.Nil(t, result)
-	require.Equal(t, http.StatusBadRequest, recorder.Code)
-	require.JSONEq(t, upstreamBody, recorder.Body.String())
+	require.Equal(t, http.StatusBadGateway, recorder.Code)
+	require.Equal(t, CarpoolMaskedUpstreamClientMessage, gjson.Get(recorder.Body.String(), "error.message").String())
+	require.NotContains(t, recorder.Body.String(), "bad search")
 	require.Equal(t, "https://compat.example/v4/alpha/search", upstream.lastReq.URL.String())
 	require.Equal(t, "Bearer sk-test", upstream.lastReq.Header.Get("Authorization"))
 	require.Equal(t, "upstream-5.6", gjson.GetBytes(upstream.lastBody, "model").String())
@@ -586,8 +587,7 @@ func TestForwardAlphaSearchAPIKeyEndpointNotFoundFailsOver(t *testing.T) {
 	require.Empty(t, recorder.Body.String())
 }
 
-// OAuth 账号的 chatgpt.com 端点固定存在，404 保持原有透传行为不变。
-func TestForwardAlphaSearchOAuthNotFoundPassesThrough(t *testing.T) {
+func TestForwardAlphaSearchOAuthNotFoundIsMasked(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	body := []byte(`{"id":"search-session","model":"gpt-5.6-sol","commands":{"search_query":[{"q":"news"}]}}`)
 	recorder := httptest.NewRecorder()
@@ -616,8 +616,9 @@ func TestForwardAlphaSearchOAuthNotFoundPassesThrough(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Nil(t, result)
-	require.Equal(t, http.StatusNotFound, recorder.Code)
-	require.JSONEq(t, upstreamBody, recorder.Body.String())
+	require.Equal(t, http.StatusBadGateway, recorder.Code)
+	require.Equal(t, CarpoolMaskedUpstreamClientMessage, gjson.Get(recorder.Body.String(), "error.message").String())
+	require.NotContains(t, recorder.Body.String(), upstreamBody)
 }
 
 func TestShouldApplyOpenAIAlphaSearchAccountErrorSideEffects(t *testing.T) {

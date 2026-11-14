@@ -411,7 +411,9 @@ func (h *GatewayHandler) handleResponsesFailoverExhaustedWithPlatform(c *gin.Con
 		statusCode = lastErr.StatusCode
 	}
 	status, code, message := statusCode, "server_error", "All available accounts exhausted"
-	if lastErr != nil && lastErr.IsCredentialFailure() {
+	if respCode, ptMsg, matched := h.matchFailoverPassthroughRule(c, platform, lastErr, "All available accounts exhausted"); matched {
+		status, code, message = respCode, "upstream_error", ptMsg
+	} else if lastErr != nil && lastErr.IsCredentialFailure() {
 		status, message = credentialFailoverClientResponse(lastErr)
 	} else if lastErr != nil && lastErr.IsOpenAICapacityShed() && strings.TrimSpace(lastErr.ClientMessage) != "" {
 		status = lastErr.ClientStatusCode
@@ -422,8 +424,6 @@ func (h *GatewayHandler) handleResponsesFailoverExhaustedWithPlatform(c *gin.Con
 	} else if lastErr != nil && service.IsOpenAISilentRefusalErrorBody(lastErr.ResponseBody) {
 		service.SetOpsUpstreamError(c, statusCode, service.OpenAISilentRefusalClientMessage(), "")
 		status, code, message = http.StatusBadGateway, "upstream_error", service.OpenAISilentRefusalClientMessage()
-	} else if respCode, ptMsg, matched := h.matchFailoverPassthroughRule(c, platform, lastErr, "All available accounts exhausted"); matched {
-		status, code, message = respCode, "upstream_error", ptMsg
 	} else if lastErr != nil && statusCode == http.StatusTooManyRequests {
 		status, code, message = http.StatusTooManyRequests, "rate_limit_error", "All available accounts are currently rate-limited. Please retry later."
 	}

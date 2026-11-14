@@ -433,6 +433,14 @@ func (h *GatewayHandler) handleCCFailoverExhaustedWithPlatform(c *gin.Context, l
 	if lastErr != nil {
 		copyFailoverRetryAfter(c, lastErr.ResponseHeaders)
 	}
+	if respCode, ptMsg, matched := h.matchFailoverPassthroughRule(c, platform, lastErr, "All available accounts exhausted"); matched {
+		if streamHasOnlyHeartbeats {
+			writeChatCompletionsFailoverErrorSSE(c, "upstream_error", ptMsg, respCode)
+			return
+		}
+		h.chatCompletionsErrorResponse(c, respCode, "upstream_error", ptMsg)
+		return
+	}
 	if lastErr != nil && lastErr.IsCredentialFailure() {
 		status, message := credentialFailoverClientResponse(lastErr)
 		if streamHasOnlyHeartbeats {
@@ -465,14 +473,6 @@ func (h *GatewayHandler) handleCCFailoverExhaustedWithPlatform(c *gin.Context, l
 			return
 		}
 		h.chatCompletionsErrorResponse(c, http.StatusBadGateway, "upstream_error", service.OpenAISilentRefusalClientMessage())
-		return
-	}
-	if respCode, ptMsg, matched := h.matchFailoverPassthroughRule(c, platform, lastErr, "All available accounts exhausted"); matched {
-		if streamHasOnlyHeartbeats {
-			writeChatCompletionsFailoverErrorSSE(c, "upstream_error", ptMsg, respCode)
-			return
-		}
-		h.chatCompletionsErrorResponse(c, respCode, "upstream_error", ptMsg)
 		return
 	}
 	if streamHasOnlyHeartbeats {

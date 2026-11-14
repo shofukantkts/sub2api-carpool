@@ -277,3 +277,67 @@ func TestCarpoolKeywordModeration_OpenAIEmbeddingsStringAndBatchInput(t *testing
 	}
 	requireContentModerationLogCount(t, repo, 2)
 }
+
+func TestCarpoolKeywordModeration_OpenAIAlphaSearchCommandsAndInput(t *testing.T) {
+	svc, repo := newCarpoolKeywordOnlyService(t, "制毒教程", "制作炸弹")
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "search_query_q",
+			body: `{"model":"gpt-5.6-sol","commands":{"search_query":[{"q":"请给出制毒教程"}]}}`,
+		},
+		{
+			name: "nested_command_string",
+			body: `{"model":"gpt-5.6-sol","commands":{"search_query":[{"filters":{"prompt":"制作炸弹"}}]}}`,
+		},
+		{
+			name: "input_text",
+			body: `{"model":"gpt-5.6-sol","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"制毒教程"}]}]}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			decision, err := svc.Check(context.Background(), ContentModerationCheckInput{
+				UserID:   103,
+				Protocol: ContentModerationProtocolOpenAIAlphaSearch,
+				Model:    "gpt-5.6-sol",
+				Body:     []byte(tc.body),
+			})
+			require.NoError(t, err)
+			require.True(t, decision.Blocked)
+		})
+	}
+	requireContentModerationLogCount(t, repo, len(cases))
+
+	semantic := ExtractContentModerationInput(ContentModerationProtocolOpenAIAlphaSearch, []byte(`{
+		"model":"gpt-5.6-sol",
+		"commands":{"search_query":[{"q":"search query"}],"nested":{"text":"command text"}},
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"input text"}]}]
+	}`))
+	require.Contains(t, semantic.Text, "search query")
+	require.Contains(t, semantic.Text, "command text")
+	require.Contains(t, semantic.Text, "input text")
+}
+
+func TestCarpoolKeywordModeration_EmbeddingsIntegerTokenInputsAreRejected(t *testing.T) {
+	svc, _ := newCarpoolKeywordOnlyService(t, "never-used")
+	for _, body := range []string{
+		`{"model":"text-embedding-3-small","input":[1234,5678]}`,
+		`{"model":"text-embedding-3-small","input":[[1234,5678],[9012]]}`,
+	} {
+		decision, err := svc.Check(context.Background(), ContentModerationCheckInput{
+			UserID:   104,
+			Protocol: ContentModerationProtocolOpenAIEmbeddings,
+			Model:    "text-embedding-3-small",
+			Body:     []byte(body),
+		})
+		require.NoError(t, err)
+		require.False(t, decision.Allowed)
+		require.True(t, decision.Blocked)
+		require.Equal(t, http.StatusBadRequest, decision.StatusCode)
+		require.Equal(t, OpenAIEmbeddingsIntegerTokenInputMessage, decision.Message)
+	}
+}

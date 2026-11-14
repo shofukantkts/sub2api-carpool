@@ -52,6 +52,8 @@ func extractContentModerationInput(protocol string, body []byte, filterReminders
 			collector.collectGeminiKeywordPayload(body, &parts, &images)
 		case ContentModerationProtocolOpenAIEmbeddings:
 			collector.collectOpenAIEmbeddingsInput(gjson.GetBytes(body, "input"), &parts)
+		case ContentModerationProtocolOpenAIAlphaSearch:
+			collector.collectOpenAIAlphaSearchPayload(body, &parts)
 		case ContentModerationProtocolOpenAIImages:
 			collector.addModerationText(&parts, gjson.GetBytes(body, "prompt").String())
 			collector.collectContentValue(gjson.GetBytes(body, "images"), &parts, &images)
@@ -78,6 +80,8 @@ func extractContentModerationInput(protocol string, body []byte, filterReminders
 		collector.collectResponsesPayload(body, &parts, &images)
 	case ContentModerationProtocolOpenAIEmbeddings:
 		collector.collectOpenAIEmbeddingsInput(gjson.GetBytes(body, "input"), &parts)
+	case ContentModerationProtocolOpenAIAlphaSearch:
+		collector.collectOpenAIAlphaSearchPayload(body, &parts)
 	case ContentModerationProtocolGemini:
 		collector.collectGeminiPayload(body, &parts, &images)
 	case ContentModerationProtocolOpenAIImages:
@@ -211,6 +215,74 @@ func (collector moderationTextCollector) collectOpenAIEmbeddingsInput(input gjso
 			return true
 		})
 	}
+}
+
+// collectOpenAIAlphaSearchPayload covers both the standalone alpha/search
+// grammar and the Responses-shaped fallback payload. Commands are intentionally
+// scanned recursively because the endpoint evolves by adding nested command
+// objects, while input is restricted to text-bearing fields to avoid auditing
+// structural role/type metadata as user content.
+func (collector moderationTextCollector) collectOpenAIAlphaSearchPayload(body []byte, parts *[]string) {
+	collector.collectAllStringValues(gjson.GetBytes(body, "commands"), parts)
+	collector.collectOpenAIAlphaSearchInput(gjson.GetBytes(body, "input"), parts)
+}
+
+func (collector moderationTextCollector) collectAllStringValues(value gjson.Result, parts *[]string) {
+	switch {
+	case !value.Exists():
+		return
+	case value.Type == gjson.String:
+		collector.addModerationText(parts, value.String())
+	case value.IsArray():
+		value.ForEach(func(_, child gjson.Result) bool {
+			collector.collectAllStringValues(child, parts)
+			return true
+		})
+	case value.IsObject():
+		value.ForEach(func(_, child gjson.Result) bool {
+			collector.collectAllStringValues(child, parts)
+			return true
+		})
+	}
+}
+
+func (collector moderationTextCollector) collectOpenAIAlphaSearchInput(value gjson.Result, parts *[]string) {
+	switch {
+	case !value.Exists():
+		return
+	case value.Type == gjson.String:
+		collector.addModerationText(parts, value.String())
+	case value.IsArray():
+		value.ForEach(func(_, child gjson.Result) bool {
+			collector.collectOpenAIAlphaSearchInput(child, parts)
+			return true
+		})
+	case value.IsObject():
+		for _, key := range []string{"text", "content", "input", "query", "q", "prompt", "message", "instruction", "instructions"} {
+			if child := value.Get(key); child.Exists() {
+				collector.collectOpenAIAlphaSearchInput(child, parts)
+			}
+		}
+	}
+}
+
+// OpenAIEmbeddingsInputContainsIntegerTokens reports whether an embeddings
+// request uses the token-ID form ([123] or [[123]]), which cannot be reduced to
+// local text for keyword moderation.
+func OpenAIEmbeddingsInputContainsIntegerTokens(body []byte) bool {
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
+		return false
+	}
+	containsNonString := false
+	input.ForEach(func(_, item gjson.Result) bool {
+		if item.Type != gjson.String {
+			containsNonString = true
+			return false
+		}
+		return true
+	})
+	return containsNonString
 }
 
 // collectSystemOneInput moderates every client-controlled text of a System One

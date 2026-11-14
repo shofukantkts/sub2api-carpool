@@ -125,18 +125,23 @@ OpenAI 兼容端点，并把 `keyword_blocking_mode` 调回 `keyword_and_api`—
   - `CARPOOL.md`
   - `backend/migrations/251_carpool_seed.sql`
   - `backend/migrations/251_carpool_seed_test.go`
+  - `backend/internal/service/carpool_security.go`
+  - `backend/internal/service/json_security.go`
+  - `backend/internal/service/json_security_test.go`
   - `backend/internal/service/carpool_keyword_bypass_test.go`
+  - `backend/internal/handler/carpool_json_security_test.go`
   - `backend/internal/handler/carpool_passthrough_empty_body_test.go`
 - 后端定制改动：
   - `backend/cmd/server/VERSION`
-  - `backend/internal/handler/openai_gateway_handler.go`（`applyOpenAIFailoverPassthroughRule` 允许空响应体命中状态码规则；OpenAI 账号处理 Anthropic Messages 时接入同一透传规则）
+  - `backend/internal/handler/openai_gateway_handler.go`（`applyOpenAIFailoverPassthroughRule` 优先于凭据失败返回，允许空响应体命中规则；OpenAI 账号反代 Anthropic Messages 时接入同一透传规则）
   - `backend/internal/handler/gateway_handler.go`（`matchFailoverPassthroughRule` 抽取共用逻辑并允许 failover 耗尽透传空响应体）
-  - `backend/internal/handler/gateway_handler_responses.go`（Anthropic 组 `/v1/responses` failover 耗尽补充匹配透传规则）
-  - `backend/internal/handler/gateway_handler_chat_completions.go`（Anthropic/兼容组 `/v1/chat/completions` failover 耗尽补充匹配透传规则；仅发心跳后补发错误帧与 `[DONE]`）
+  - `backend/internal/handler/gateway_handler_responses.go`（Anthropic 组 `/v1/responses` failover 耗尽优先匹配透传规则）
+  - `backend/internal/handler/gateway_handler_chat_completions.go`（Anthropic/兼容组 `/v1/chat/completions` failover 耗尽优先匹配透传规则；仅发心跳后补发错误帧与 `[DONE]`）
   - `backend/internal/handler/gemini_v1beta_handler.go`（Gemini failover 耗尽透传允许空响应体）
-  - `backend/internal/service/content_moderation.go`、`backend/internal/service/content_moderation_input.go`（新增 Embeddings 协议；关键词扫描所有客户端可控的 `system`/`developer`/`user` 文本、Responses `instructions`、Anthropic 顶层 `system`、Gemini `systemInstruction`/`system_instruction`；语义审核仍保持最新 `user` 行为）
-  - `backend/internal/service/openai_embeddings.go`、`backend/internal/handler/openai_embeddings.go`（非 failover 4xx 错误透传规则及协议接线）
-  - `backend/internal/service/openai_alpha_search.go`、`backend/internal/handler/openai_alpha_search.go`（独立 Alpha Search 与 Responses fallback 的非 failover 错误透传规则）
+  - `backend/internal/handler/security_audit_helper.go`（全局拦截重复 JSON 键，杜绝解析差异绕过）
+  - `backend/internal/service/content_moderation.go`、`backend/internal/service/content_moderation_input.go`（新增 Embeddings 与 Alpha Search 协议；拦截 Embeddings 整数 token 数组输入；关键词扫描所有客户端可控的 `system`/`developer`/`user` 文本、Responses `instructions`、Anthropic 顶层 `system`、Gemini `systemInstruction`/`system_instruction`；语义审核仍保持最新 `user` 行为）
+  - `backend/internal/service/openai_embeddings.go`、`backend/internal/handler/openai_embeddings.go`（非 failover 错误优先匹配透传规则，未命中时统一 502 兜底伪装并记录 ops 真实错误）
+  - `backend/internal/service/openai_alpha_search.go`、`backend/internal/handler/openai_alpha_search.go`（独立 Alpha Search 与 Responses fallback 非 failover 错误透传规则与未命中统一 502 兜底伪装）
 - Go `1.27.4` 安全构建对齐（修复 CI/govulncheck 标准库告警，上游升级后可直接跟进）：
   - `backend/go.mod`、`Dockerfile`、`backend/Dockerfile`、`deploy/Dockerfile`、`.github/workflows/{backend-ci,security-scan,release}.yml`
 
@@ -146,11 +151,14 @@ OpenAI 兼容端点，并把 `keyword_blocking_mode` 调回 `keyword_and_api`—
 ## 五、已知边界
 
 - 关键词提取与匹配边界：
-  - 本地关键词审核会全面扫描当前请求中客户端可控的所有 `system`/`developer`/`user` 消息文本，以及 OpenAI Responses `instructions`、Anthropic 顶层 `system`、Gemini `systemInstruction`/`system_instruction`；因此头部指令、中间历史 user、开头 user 和工具循环末尾的顶层指令都不会绕过拦截。
-  - `assistant`/`model`/`tool`/`tool_result`/`functionResponse`/`function_call_output` 等非客户端指令结果文本仍排除，避免把模型输出或工具回传误判为车友输入；语义审核的“最新 user”边界保持上游行为不变。Embeddings 同时检查 `input` 的单个字符串和字符串数组。
+  - 本地关键词审核会全面扫描当前请求中客户端可控的所有 `system`/`developer`/`user` 消息文本，以及 OpenAI Responses `instructions`、Anthropic 顶层 `system`、Gemini `systemInstruction`/`system_instruction`，以及 Alpha Search 的 `commands` 与 `input` 文本；因此头部指令、中间历史 user、开头 user、搜索词和工具循环末尾的顶层指令都不会绕过拦截。
+  - `assistant`/`model`/`tool`/`tool_result`/`functionResponse`/`function_call_output` 等非客户端指令结果文本仍排除，避免把模型输出或工具回传误判为车友输入；语义审核的“最新 user”边界保持上游行为不变。Embeddings 同时检查 `input` 的单个字符串和字符串数组；整数 token 数组输入直接拒绝，防范绕过。
+  - 全局前置校验拒绝重复 JSON 键（RFC 8259 规范），杜绝网关与上游解析器不一致引发的走私绕过漏洞。
   - 匹配为大小写不敏感的子串匹配（`strings.Contains`），在后台追加短关键词时注意避免误伤正常语义。
 - 上游报错伪装边界：
   - 所有预置 `carpool-mask-*` 规则默认统一改写为 `502` 与同一条通用文案，不对外区分上游错误类型；若后续希望放开 `429` 或 `400` 类原状态码，可在后台对应规则中开启「透传状态码」。
+  - 凭据类 failover 失败优先匹配透传规则，统一伪装为 502 通用文案，避免暴露内部账号体系与 OAuth 凭据信息。
+  - 原生 Embeddings 与 Alpha Search 在非 failover 出现上游错误时，若规则未匹配，自动回退至统一 502 兜底伪装文案并写入 ops 日志，确保上游真实错误体绝不直接暴露给客户端。
   - 流式请求中上游**已开始输出正文后**的中断无法伪装（SSE 已发出 200），种子规则只覆盖响应头之前（或仅发出 keepalive 心跳未输出正文前）的失败；Chat Completions 在后者会补发错误帧和 `[DONE]`。
   - 空响应体且带 HTTP 状态码的上游失败现已可命中按状态码匹配的规则（含原生路由及 `/v1/responses`、`/v1/chat/completions` 兼容路由 failover 耗尽）；无 HTTP 状态码且无 `LastFailoverErr` 的本地调度/连接失败仍走通用 502 兜底文案。
   - OpenAI 凭据/访问态拒绝、过载降级（`IsOpenAICapacityShed`）、兼容模型不存在 400、静默拒绝以及 `cyber_policy` 硬阻断会在透传规则之前返回；Responses WebSocket 模式则使用内置脱敏关闭文案，不读取 `error_passthrough_rules`。
