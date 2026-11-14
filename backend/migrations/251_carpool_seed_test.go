@@ -80,6 +80,7 @@ func TestCarpoolSeed_ContentModerationConfig(t *testing.T) {
 	require.NotEmpty(t, cfg.BlockedKeywords, "seed ships a non-empty keyword list")
 	require.Equal(t, 403, cfg.BlockStatus)
 	require.NotEmpty(t, strings.TrimSpace(cfg.BlockMessage))
+	require.NotContains(t, cfg.BlockMessage, "车主", "client-facing block_message must not leak carpool wording")
 	require.False(t, cfg.AutoBanEnabled, "carpool seed blocks without auto-ban")
 	require.Equal(t, "all", cfg.ModelFilter.Type)
 
@@ -283,8 +284,8 @@ func TestCarpoolSeed_ErrorPassthroughRules(t *testing.T) {
 		require.False(t, rule.SkipMonitoring, "rule %s keeps ops records for the owner", rule.Name)
 	}
 
-	// 语义断言：所有伪装规则一律改写为 502 与同一条通用文案，不区分错误类型。
-	const unifiedMessage = "上游服务暂时不可用，请稍后重试；若持续失败请联系车主。"
+	// 语义断言：所有伪装规则一律改写为 502 与同一条通用文案，不区分错误类型，且不包含"车主"。
+	const unifiedMessage = "上游服务暂时不可用，请稍后重试；若持续失败请联系管理员。"
 	byName := map[string]*model.ErrorPassthroughRule{}
 	for _, r := range rules {
 		byName[r.Name] = r
@@ -292,6 +293,7 @@ func TestCarpoolSeed_ErrorPassthroughRules(t *testing.T) {
 		require.NotNil(t, r.ResponseCode, "rule %s must define response_code", r.Name)
 		require.Equal(t, 502, *r.ResponseCode, "rule %s must return 502", r.Name)
 		require.Equal(t, unifiedMessage, *r.CustomMessage, "rule %s must use unified masking message", r.Name)
+		require.NotContains(t, *r.CustomMessage, "车主", "rule %s must not leak carpool wording", r.Name)
 	}
 	require.Equal(t, []int{500, 502, 503, 504, 529}, byName["carpool-mask-5xx"].ErrorCodes)
 	require.Equal(t, []int{401, 402, 403}, byName["carpool-mask-auth"].ErrorCodes)
