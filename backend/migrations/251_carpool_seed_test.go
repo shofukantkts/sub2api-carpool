@@ -109,8 +109,8 @@ func TestCarpoolSeed_RiskControlEnabledOn(t *testing.T) {
 // 并直接构造 model.ErrorPassthroughRule，供 Validate() 校验。
 // 列序与 251_carpool_seed.sql 的 VALUES 列清单一一对应：
 // (name, enabled, priority, error_codes, keywords, match_mode,
-//  platforms, passthrough_code, response_code, passthrough_body,
-//  custom_message, skip_monitoring, description)
+// platforms, passthrough_code, response_code, passthrough_body,
+// custom_message, skip_monitoring, description)
 func parseCarpoolRuleRows(t *testing.T) []*model.ErrorPassthroughRule {
 	t.Helper()
 	raw := carpoolSeedSQL(t)
@@ -134,10 +134,10 @@ func parseCarpoolRuleRows(t *testing.T) []*model.ErrorPassthroughRule {
 	for i := 0; i < len(tuplesOnly); i++ {
 		c := tuplesOnly[i]
 		if c == '\'' {
-			buf.WriteByte(c)
+			_ = buf.WriteByte(c)
 			// 处理 SQL 单引号转义 ''
 			if inString && i+1 < len(tuplesOnly) && tuplesOnly[i+1] == '\'' {
-				buf.WriteByte(tuplesOnly[i+1])
+				_ = buf.WriteByte(tuplesOnly[i+1])
 				i++
 				continue
 			}
@@ -163,7 +163,7 @@ func parseCarpoolRuleRows(t *testing.T) []*model.ErrorPassthroughRule {
 			}
 		}
 		if depth > 0 {
-			buf.WriteByte(c)
+			_ = buf.WriteByte(c)
 		}
 	}
 	require.Equal(t, 0, depth, "unbalanced parentheses in VALUES block")
@@ -226,12 +226,12 @@ func splitSQLTuple(s string) ([]string, error) {
 		switch {
 		case c == '\'':
 			inString = !inString
-			buf.WriteByte(c)
+			_ = buf.WriteByte(c)
 		case c == ',' && !inString:
 			fields = append(fields, strings.TrimSpace(buf.String()))
 			buf.Reset()
 		default:
-			buf.WriteByte(c)
+			_ = buf.WriteByte(c)
 		}
 	}
 	fields = append(fields, strings.TrimSpace(buf.String()))
