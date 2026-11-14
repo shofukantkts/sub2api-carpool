@@ -29,7 +29,7 @@ func TestValidateJSONNoDuplicateKeys(t *testing.T) {
 			if tt.wantError {
 				require.Error(t, err)
 				require.True(t, errors.Is(err, ErrDuplicateJSONKeys))
-				require.Equal(t, DuplicateJSONKeysMessage, err.Error())
+				require.Equal(t, ErrDuplicateJSONKeys.Error(), err.Error())
 				return
 			}
 			require.NoError(t, err)

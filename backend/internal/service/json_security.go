@@ -10,7 +10,7 @@ import (
 
 const DuplicateJSONKeysMessage = "Invalid JSON: duplicate keys are not permitted"
 
-var ErrDuplicateJSONKeys = errors.New(DuplicateJSONKeysMessage)
+var ErrDuplicateJSONKeys = errors.New("invalid JSON: duplicate keys are not permitted")
 
 // ValidateJSONNoDuplicateKeys validates a JSON document and rejects conflicting
 // duplicate object members at every nesting level. Identical repeated keys with
