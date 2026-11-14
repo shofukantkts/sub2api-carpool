@@ -104,6 +104,9 @@ func TestCarpoolSeed_ContentModerationConfig(t *testing.T) {
 func TestCarpoolSeed_RiskControlEnabledOn(t *testing.T) {
 	require.Equal(t, "true", carpoolSettingValue(t, "risk_control_enabled"))
 	require.Equal(t, "false", carpoolSettingValue(t, "allow_user_view_error_requests"))
+	raw := carpoolSeedSQL(t)
+	require.Contains(t, raw, "ON CONFLICT (key) DO UPDATE\nSET value = 'true', updated_at = NOW();",
+		"risk_control_enabled must override the pre-existing false seed from content moderation")
 }
 
 // parseCarpoolRuleRows 按种子文件的固定列序解析 INSERT ... FROM (VALUES ...) 行，

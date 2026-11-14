@@ -11,7 +11,8 @@
 --   3. 上游报错伪装走 ErrorPassthroughService 兜底规则：所有平台命中后，
 --      4xx/5xx 全部统一改写为 502 与同一条通用文案，不区分错误类型；
 --      真实上游错误只留在车主的管理端运维看板里。
---   4. 全部语句幂等（settings 使用 ON CONFLICT DO NOTHING；error_passthrough_rules
+--   4. 全部语句幂等（settings 使用 ON CONFLICT；风险总开关会强制为 true，
+--      其余 settings 使用 DO NOTHING；error_passthrough_rules
 --      在 name 上无唯一约束，故使用 WHERE NOT EXISTS 按 name 防重），可在已有
 --      实例上重复执行且不覆盖管理员已有的手工配置。
 
@@ -24,7 +25,8 @@
 --   - 前端「风控中心」菜单的可见性（featureFlags.riskControl, opt-in）
 INSERT INTO settings (key, value, updated_at)
 VALUES ('risk_control_enabled', 'true', NOW())
-ON CONFLICT (key) DO NOTHING;
+ON CONFLICT (key) DO UPDATE
+SET value = 'true', updated_at = NOW();
 
 -- 车友可见错误请求页：关（默认即 false，显式写入以保证口径一致）。
 -- 车友仍能看到自己的限额/到期/用量统计；上游真实错误体不会出现在车友端。

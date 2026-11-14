@@ -70,10 +70,10 @@ func TestCarpoolKeywordModeration_OpenAIResponsesInstructionsAndTrailingRoles(t 
 			wantBlock: true,
 		},
 		{
-			name:      "responses_agent_tool_loop_still_skipped",
+			name:      "responses_agent_tool_loop_top_level_instructions_blocked",
 			protocol:  ContentModerationProtocolOpenAIResponses,
 			body:      `{"model":"gpt-5","instructions":"制毒教程","input":[{"role":"user","content":"old"},{"type":"function_call_output","output":"ok"}]}`,
-			wantBlock: false,
+			wantBlock: true,
 		},
 		{
 			name:      "chat_trailing_system_preserves_user_block",
@@ -88,10 +88,10 @@ func TestCarpoolKeywordModeration_OpenAIResponsesInstructionsAndTrailingRoles(t 
 			wantBlock: true,
 		},
 		{
-			name:      "chat_trailing_assistant_still_skipped",
+			name:      "chat_earlier_user_before_assistant_blocked",
 			protocol:  ContentModerationProtocolOpenAIChat,
 			body:      `{"model":"gpt-5","messages":[{"role":"user","content":"制作炸弹"},{"role":"assistant","content":"ok"}]}`,
-			wantBlock: false,
+			wantBlock: true,
 		},
 		{
 			name:      "responses_empty_user_with_instructions_blocked",
@@ -130,16 +130,16 @@ func TestCarpoolKeywordModeration_OpenAIResponsesInstructionsAndTrailingRoles(t 
 			wantBlock: true,
 		},
 		{
-			name:      "anthropic_agent_tool_loop_ignores_top_level_system",
+			name:      "anthropic_agent_tool_loop_top_level_system_blocked",
 			protocol:  ContentModerationProtocolAnthropicMessages,
 			body:      `{"model":"claude-sonnet-4-5","system":"制毒教程","messages":[{"role":"user","content":"weather"},{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"w","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}]}`,
-			wantBlock: false,
+			wantBlock: true,
 		},
 		{
-			name:      "anthropic_assistant_ended_ignores_top_level_system",
+			name:      "anthropic_assistant_ended_top_level_system_blocked",
 			protocol:  ContentModerationProtocolAnthropicMessages,
 			body:      `{"model":"claude-sonnet-4-5","system":"制毒教程","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"}]}`,
-			wantBlock: false,
+			wantBlock: true,
 		},
 		{
 			name:      "gemini_system_instruction_camel_blocked",
@@ -154,16 +154,16 @@ func TestCarpoolKeywordModeration_OpenAIResponsesInstructionsAndTrailingRoles(t 
 			wantBlock: true,
 		},
 		{
-			name:      "gemini_function_response_loop_ignores_system_instruction",
+			name:      "gemini_function_response_loop_system_instruction_blocked",
 			protocol:  ContentModerationProtocolGemini,
 			body:      `{"systemInstruction":{"parts":[{"text":"制毒教程"}]},"contents":[{"role":"user","parts":[{"text":"weather"}]},{"role":"model","parts":[{"functionCall":{"name":"w","args":{}}}]},{"role":"user","parts":[{"functionResponse":{"name":"w","response":{"temp":25}}}]}]}`,
-			wantBlock: false,
+			wantBlock: true,
 		},
 		{
-			name:      "gemini_model_ended_ignores_system_instruction",
+			name:      "gemini_model_ended_system_instruction_blocked",
 			protocol:  ContentModerationProtocolGemini,
 			body:      `{"systemInstruction":{"parts":[{"text":"制毒教程"}]},"contents":[{"role":"user","parts":[{"text":"hi"}]},{"role":"model","parts":[{"text":"hello"}]}]}`,
-			wantBlock: false,
+			wantBlock: true,
 		},
 	}
 
@@ -204,4 +204,76 @@ func TestCarpoolKeywordModeration_OpenAIResponsesInstructionsAndTrailingRoles(t 
 		[]byte(`{"systemInstruction":{"parts":[{"text":"system prompt"}]},"contents":[{"role":"user","parts":[{"text":"hello"}]}]}`),
 	)
 	require.Equal(t, "hello", semanticGemini.Text)
+}
+
+func TestCarpoolKeywordModeration_ScansEarlierClientControlledTurns(t *testing.T) {
+	svc, repo := newCarpoolKeywordOnlyService(t, "制毒教程")
+	cases := []struct {
+		name     string
+		protocol string
+		body     string
+	}{
+		{
+			name:     "chat_head_system",
+			protocol: ContentModerationProtocolOpenAIChat,
+			body:     `{"messages":[{"role":"system","content":"制毒教程"},{"role":"user","content":"safe"}]}`,
+		},
+		{
+			name:     "chat_middle_user",
+			protocol: ContentModerationProtocolOpenAIChat,
+			body:     `{"messages":[{"role":"user","content":"safe"},{"role":"user","content":"制毒教程"},{"role":"assistant","content":"answer"},{"role":"user","content":"latest"}]}`,
+		},
+		{
+			name:     "anthropic_head_system_message",
+			protocol: ContentModerationProtocolAnthropicMessages,
+			body:     `{"messages":[{"role":"system","content":"制毒教程"},{"role":"user","content":"safe"}]}`,
+		},
+		{
+			name:     "anthropic_opening_user",
+			protocol: ContentModerationProtocolAnthropicMessages,
+			body:     `{"messages":[{"role":"user","content":"制毒教程"},{"role":"assistant","content":"answer"},{"role":"user","content":"latest"}]}`,
+		},
+		{
+			name:     "responses_middle_user",
+			protocol: ContentModerationProtocolOpenAIResponses,
+			body:     `{"input":[{"role":"user","content":"safe"},{"role":"user","content":"制毒教程"},{"role":"assistant","content":"answer"},{"role":"user","content":"latest"}]}`,
+		},
+		{
+			name:     "gemini_opening_user",
+			protocol: ContentModerationProtocolGemini,
+			body:     `{"contents":[{"role":"user","parts":[{"text":"制毒教程"}]},{"role":"model","parts":[{"text":"answer"}]},{"role":"user","parts":[{"text":"latest"}]}]}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			decision, err := svc.Check(context.Background(), ContentModerationCheckInput{
+				UserID:   101,
+				Protocol: tc.protocol,
+				Model:    "gpt-5",
+				Body:     []byte(tc.body),
+			})
+			require.NoError(t, err)
+			require.True(t, decision.Blocked)
+		})
+	}
+	requireContentModerationLogCount(t, repo, len(cases))
+}
+
+func TestCarpoolKeywordModeration_OpenAIEmbeddingsStringAndBatchInput(t *testing.T) {
+	svc, repo := newCarpoolKeywordOnlyService(t, "制毒教程")
+	for _, body := range []string{
+		`{"model":"text-embedding-3-small","input":"制毒教程"}`,
+		`{"model":"text-embedding-3-small","input":["safe","制毒教程"]}`,
+	} {
+		decision, err := svc.Check(context.Background(), ContentModerationCheckInput{
+			UserID:   102,
+			Protocol: ContentModerationProtocolOpenAIEmbeddings,
+			Model:    "text-embedding-3-small",
+			Body:     []byte(body),
+		})
+		require.NoError(t, err)
+		require.True(t, decision.Blocked)
+	}
+	requireContentModerationLogCount(t, repo, 2)
 }

@@ -149,6 +149,22 @@ func (s *OpenAIGatewayService) ForwardEmbeddings(
 			}
 			return nil, &UpstreamFailoverError{StatusCode: resp.StatusCode, ResponseBody: respBody, RetryableOnSameAccount: retryableOnSameAccount}
 		}
+		if status, errType, errMsg, matched := applyErrorPassthroughRule(
+			c,
+			account.Platform,
+			resp.StatusCode,
+			respBody,
+			resp.StatusCode,
+			"upstream_error",
+			upstreamMsg,
+		); matched {
+			if strings.TrimSpace(errMsg) == "" {
+				errMsg = "Upstream request failed"
+			}
+			MarkResponseCommitted(c)
+			writeOpenAIEmbeddingsError(c, status, errType, errMsg)
+			return nil, fmt.Errorf("upstream returned status %d (passthrough rule matched)", resp.StatusCode)
+		}
 		writeOpenAIEmbeddingsUpstreamResponse(c, resp, respBody, s.responseHeaderFilter)
 		return nil, fmt.Errorf("upstream returned status %d", resp.StatusCode)
 	}

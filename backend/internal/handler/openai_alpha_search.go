@@ -86,6 +86,9 @@ func (h *OpenAIGatewayHandler) AlphaSearch(c *gin.Context) {
 		h.openAISecurityAuditError(c, decision)
 		return
 	}
+	if h.errorPassthroughService != nil {
+		service.BindErrorPassthroughService(c, h.errorPassthroughService)
+	}
 
 	channelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(c.Request.Context(), apiKey.GroupID, requestedModel)
 	forwardBody := openAIModelMappedBody(body, channelMapping.Mapped, channelMapping.MappedModel, h.gatewayService.ReplaceModelInBody)

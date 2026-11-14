@@ -2,7 +2,9 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -423,7 +425,9 @@ func (h *GatewayHandler) handleCCFailoverExhausted(c *gin.Context, lastErr *serv
 }
 
 func (h *GatewayHandler) handleCCFailoverExhaustedWithPlatform(c *gin.Context, lastErr *service.UpstreamFailoverError, platform string, streamStarted bool) {
-	if streamStarted {
+	streamHasOnlyHeartbeats := streamStarted && c != nil && c.Writer != nil &&
+		(c.Writer.Size() <= 0 || gatewayStreamHasOnlyHeartbeats(c))
+	if streamStarted && !streamHasOnlyHeartbeats {
 		return
 	}
 	if lastErr != nil {
@@ -431,6 +435,10 @@ func (h *GatewayHandler) handleCCFailoverExhaustedWithPlatform(c *gin.Context, l
 	}
 	if lastErr != nil && lastErr.IsCredentialFailure() {
 		status, message := credentialFailoverClientResponse(lastErr)
+		if streamHasOnlyHeartbeats {
+			writeChatCompletionsFailoverErrorSSE(c, "server_error", message, status)
+			return
+		}
 		h.chatCompletionsErrorResponse(c, status, "server_error", message)
 		return
 	}
@@ -438,6 +446,10 @@ func (h *GatewayHandler) handleCCFailoverExhaustedWithPlatform(c *gin.Context, l
 		status := lastErr.ClientStatusCode
 		if status <= 0 {
 			status = http.StatusServiceUnavailable
+		}
+		if streamHasOnlyHeartbeats {
+			writeChatCompletionsFailoverErrorSSE(c, "server_error", lastErr.ClientMessage, status)
+			return
 		}
 		h.chatCompletionsErrorResponse(c, status, "server_error", lastErr.ClientMessage)
 		return
@@ -448,12 +460,52 @@ func (h *GatewayHandler) handleCCFailoverExhaustedWithPlatform(c *gin.Context, l
 	}
 	if lastErr != nil && service.IsOpenAISilentRefusalErrorBody(lastErr.ResponseBody) {
 		service.SetOpsUpstreamError(c, statusCode, service.OpenAISilentRefusalClientMessage(), "")
+		if streamHasOnlyHeartbeats {
+			writeChatCompletionsFailoverErrorSSE(c, "upstream_error", service.OpenAISilentRefusalClientMessage(), http.StatusBadGateway)
+			return
+		}
 		h.chatCompletionsErrorResponse(c, http.StatusBadGateway, "upstream_error", service.OpenAISilentRefusalClientMessage())
 		return
 	}
 	if respCode, ptMsg, matched := h.matchFailoverPassthroughRule(c, platform, lastErr, "All available accounts exhausted"); matched {
+		if streamHasOnlyHeartbeats {
+			writeChatCompletionsFailoverErrorSSE(c, "upstream_error", ptMsg, respCode)
+			return
+		}
 		h.chatCompletionsErrorResponse(c, respCode, "upstream_error", ptMsg)
 		return
 	}
+	if streamHasOnlyHeartbeats {
+		writeChatCompletionsFailoverErrorSSE(c, "server_error", "All available accounts exhausted", statusCode)
+		return
+	}
 	h.chatCompletionsErrorResponse(c, statusCode, "server_error", "All available accounts exhausted")
+}
+
+// writeChatCompletionsFailoverErrorSSE terminates a Chat Completions stream
+// that has committed only keepalive comments. Once an actual response chunk
+// exists, the caller preserves the already-started stream instead.
+func writeChatCompletionsFailoverErrorSSE(c *gin.Context, errType, message string, status int) {
+	service.MarkOpsStreamError(c, errType, message, status)
+	if c == nil || c.Writer == nil {
+		return
+	}
+	payload, err := json.Marshal(gin.H{
+		"error": gin.H{
+			"type":    errType,
+			"message": message,
+		},
+	})
+	if err != nil {
+		payload = []byte(`{"error":{"type":"server_error","message":"Upstream request failed"}}`)
+	}
+	if c.Writer.Header().Get("Content-Type") == "" {
+		c.Header("Content-Type", "text/event-stream")
+	}
+	if _, err := fmt.Fprintf(c.Writer, "data: %s\n\ndata: [DONE]\n\n", payload); err != nil {
+		_ = c.Error(err)
+	}
+	if flusher, ok := c.Writer.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }

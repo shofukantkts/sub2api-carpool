@@ -17,9 +17,10 @@ func ExtractContentModerationInput(protocol string, body []byte) ContentModerati
 	return extractContentModerationInput(protocol, body, true, false)
 }
 
-// Keyword checks share semantic moderation's current-user boundaries, but must
-// inspect client-supplied reminder blocks, OpenAI Responses instructions, and
-// trailing system/developer messages as ordinary text.
+// Keyword checks intentionally have broader boundaries than semantic
+// moderation. They inspect every client-controlled system/developer/user turn
+// and the independent top-level instruction fields, while semantic moderation
+// continues to use the latest-user-turn behavior below unchanged.
 func extractContentModerationKeywordText(protocol string, body []byte) string {
 	return extractContentModerationInput(protocol, body, false, true).Text
 }
@@ -39,6 +40,35 @@ func extractContentModerationInput(protocol string, body []byte, filterReminders
 	}
 	var parts []string
 	var images []string
+	if includeKeywordBypasses {
+		switch protocol {
+		case ContentModerationProtocolAnthropicMessages:
+			collector.collectAnthropicKeywordPayload(body, &parts, &images)
+		case ContentModerationProtocolOpenAIChat:
+			collector.collectOpenAIChatKeywordPayload(body, &parts, &images)
+		case ContentModerationProtocolOpenAIResponses:
+			collector.collectResponsesKeywordPayload(body, &parts, &images)
+		case ContentModerationProtocolGemini:
+			collector.collectGeminiKeywordPayload(body, &parts, &images)
+		case ContentModerationProtocolOpenAIEmbeddings:
+			collector.collectOpenAIEmbeddingsInput(gjson.GetBytes(body, "input"), &parts)
+		case ContentModerationProtocolOpenAIImages:
+			collector.addModerationText(&parts, gjson.GetBytes(body, "prompt").String())
+			collector.collectContentValue(gjson.GetBytes(body, "images"), &parts, &images)
+		case ContentModerationProtocolTypeSafeSystemOne:
+			collector.collectSystemOneInput(body, &parts)
+		default:
+			// Preserve the historical fallback for protocols that do not have a
+			// dedicated keyword grammar yet.
+			collector.collectResponsesPayload(body, &parts, &images)
+			collector.collectLastRoleMessage(gjson.GetBytes(body, "messages"), "user", &parts, &images)
+			collector.collectGeminiPayload(body, &parts, &images)
+		}
+		return ContentModerationInput{
+			Text:   normalizeContentModerationText(strings.Join(parts, "\n")),
+			Images: normalizeModerationImages(images),
+		}
+	}
 	switch protocol {
 	case ContentModerationProtocolAnthropicMessages:
 		collector.collectAnthropicPayload(body, &parts, &images)
@@ -46,6 +76,8 @@ func extractContentModerationInput(protocol string, body []byte, filterReminders
 		collector.collectLastRoleMessage(gjson.GetBytes(body, "messages"), "user", &parts, &images)
 	case ContentModerationProtocolOpenAIResponses:
 		collector.collectResponsesPayload(body, &parts, &images)
+	case ContentModerationProtocolOpenAIEmbeddings:
+		collector.collectOpenAIEmbeddingsInput(gjson.GetBytes(body, "input"), &parts)
 	case ContentModerationProtocolGemini:
 		collector.collectGeminiPayload(body, &parts, &images)
 	case ContentModerationProtocolOpenAIImages:
@@ -68,6 +100,117 @@ func extractContentModerationInput(protocol string, body []byte, filterReminders
 		out.Normalize()
 	}
 	return out
+}
+
+// collectOpenAIChatKeywordPayload collects only client-controlled message
+// roles. Assistant/tool history is deliberately excluded, but every user,
+// system, and developer turn is inspected, including earlier turns.
+func (collector moderationTextCollector) collectOpenAIChatKeywordPayload(body []byte, parts *[]string, images *[]string) {
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.IsArray() {
+		return
+	}
+	messages.ForEach(func(_, message gjson.Result) bool {
+		switch strings.ToLower(strings.TrimSpace(message.Get("role").String())) {
+		case "system", "developer", "user":
+			collector.collectContentValue(message.Get("content"), parts, images)
+		}
+		return true
+	})
+}
+
+// collectAnthropicKeywordPayload scans all client-controlled message roles and
+// always scans the request's independent top-level system field. Tool-use and
+// tool-result blocks remain excluded by collectAnthropicUserContentValue.
+func (collector moderationTextCollector) collectAnthropicKeywordPayload(body []byte, parts *[]string, images *[]string) {
+	if system := gjson.GetBytes(body, "system"); system.Exists() {
+		collector.collectAnthropicUserContentValue(system, parts, images)
+	}
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.IsArray() {
+		return
+	}
+	messages.ForEach(func(_, message gjson.Result) bool {
+		switch strings.ToLower(strings.TrimSpace(message.Get("role").String())) {
+		case "system", "developer", "user":
+			collector.collectAnthropicUserContentValue(message.Get("content"), parts, images)
+		}
+		return true
+	})
+}
+
+// collectResponsesKeywordPayload scans all client-controlled Responses input
+// items and always includes top-level instructions. A role-less input_text
+// item is a client prompt and is included; assistant/tool/function items are
+// not.
+func (collector moderationTextCollector) collectResponsesKeywordPayload(body []byte, parts *[]string, images *[]string) {
+	if instructions := gjson.GetBytes(body, "instructions"); instructions.Exists() {
+		collector.collectContentValue(instructions, parts, images)
+	}
+	input := gjson.GetBytes(body, "input")
+	switch {
+	case input.Type == gjson.String:
+		collector.addModerationText(parts, input.String())
+	case input.IsArray():
+		input.ForEach(func(_, item gjson.Result) bool {
+			if collector.isResponsesKeywordItem(item) {
+				collector.collectResponsesItemText(item, parts, images)
+			}
+			return true
+		})
+	case input.IsObject():
+		if collector.isResponsesKeywordItem(input) {
+			collector.collectResponsesItemText(input, parts, images)
+		}
+	}
+}
+
+func (collector moderationTextCollector) isResponsesKeywordItem(item gjson.Result) bool {
+	role := strings.ToLower(strings.TrimSpace(item.Get("role").String()))
+	switch role {
+	case "system", "developer", "user":
+		return true
+	case "":
+		return collector.isResponsesUserTextItem(item)
+	default:
+		return false
+	}
+}
+
+// collectGeminiKeywordPayload scans all client-controlled contents roles and
+// always includes both spellings of top-level system instruction. Model/tool
+// turns are excluded from keyword text.
+func (collector moderationTextCollector) collectGeminiKeywordPayload(body []byte, parts *[]string, images *[]string) {
+	for _, key := range []string{"systemInstruction", "system_instruction"} {
+		if system := gjson.GetBytes(body, key); system.Exists() {
+			collector.collectGeminiContentParts(system, parts, images)
+		}
+	}
+	contents := gjson.GetBytes(body, "contents")
+	if !contents.IsArray() {
+		return
+	}
+	contents.ForEach(func(_, content gjson.Result) bool {
+		role := strings.ToLower(strings.TrimSpace(content.Get("role").String()))
+		if role == "" || role == "user" || role == "system" || role == "developer" {
+			collector.collectGeminiContentParts(content, parts, images)
+		}
+		return true
+	})
+}
+
+func (collector moderationTextCollector) collectOpenAIEmbeddingsInput(input gjson.Result, parts *[]string) {
+	switch {
+	case input.Type == gjson.String:
+		collector.addModerationText(parts, input.String())
+	case input.IsArray():
+		input.ForEach(func(_, item gjson.Result) bool {
+			if item.Type == gjson.String {
+				collector.addModerationText(parts, item.String())
+			}
+			return true
+		})
+	}
 }
 
 // collectSystemOneInput moderates every client-controlled text of a System One

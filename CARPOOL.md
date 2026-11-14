@@ -1,8 +1,8 @@
 # Sub2API 拼车（GPT Pro 20X 车主/车友）定制说明
 
 本仓库是 `Wei-Shaw/sub2api` 的拼车场景定制版。核心能力来自上游内置实现，并在此基础上
-补充了**种子迁移 + 少量后端防护补丁**（空响应体错误透传及兼容路由 failover 兜底覆盖、
-全协议 system/instructions 与末尾 `system`/`developer` 关键词拦截），前端代码零改动。
+补充了**种子迁移 + 后端防护补丁**（空响应体错误透传、兼容路由 failover 兜底、
+非 failover 原生 OpenAI 错误透传、全客户端可控指令/消息关键词拦截），前端代码零改动。
 
 - 定制种子：`backend/migrations/251_carpool_seed.sql`（服务启动时自动执行，幂等）
 - 种子与补丁测试：`backend/migrations/251_carpool_seed_test.go`、`backend/internal/service/carpool_keyword_bypass_test.go`、`backend/internal/handler/carpool_passthrough_empty_body_test.go`
@@ -14,8 +14,8 @@
 | 车友看限额/过期时间 | API Key 自带 `quota/quota_used/expires_at` + 5h/1d/7d 滚动窗口限流；用户面板 `/api/v1/keys`、`/usage/dashboard/*`、`/user/api-keys/:id/usage/daily` 全部现成 | 无需改动 |
 | 车友看使用日志 | 用户端用量列表 `/api/v1/usage` 现成；错误请求页 `/api/v1/usage/errors` 受 `allow_user_view_error_requests` 开关控制（fail-closed，且已脱敏白名单视图） | 种子设为 `false`：车友看不到上游错误明细 |
 | 车主添加渠道（标准 API） | 账号体系同时支持 `oauth`（Codex OAuth 等）与 `apikey`（标准 API 接口）两类，管理后台「账号管理」直接添加 | 无需改动 |
-| 上游报错伪装 | `ErrorPassthroughService` 兜底规则：命中后用 `custom_message` 改写文案，`response_code` 改写状态码；上游真实错误只进车主的 ops 运维看板（存储时已脱敏凭据字段） | 种子预置 4 条全平台兜底规则 + handler 支持空响应体命中状态码规则 |
-| 违规内容前置过滤、不发上游 | `ContentModerationService`（pre_block + keyword_blocking_mode=keyword_only）：本地关键词同步拦截，命中即 403，**不调用任何外部审核 API、不发上游请求** | 种子预置初始关键词表 + 本地关键词补充覆盖 `instructions` 与末尾 `system`/`developer` 项 |
+| 上游报错伪装 | `ErrorPassthroughService` 兜底规则：命中后用 `custom_message` 改写文案，`response_code` 改写状态码；上游真实错误只进车主的 ops 运维看板（存储时已脱敏凭据字段） | 种子预置 4 条全平台兜底规则；原生 Embeddings/Alpha Search 非 failover 错误、兼容路由 failover 及空响应体均走规则 |
+| 违规内容前置过滤、不发上游 | `ContentModerationService`（pre_block + keyword_blocking_mode=keyword_only）：本地关键词同步拦截，命中即 403，**不调用任何外部审核 API、不发上游请求** | 种子预置初始关键词表 + 本地关键词扫描所有客户端可控的 `system`/`developer`/`user` 文本及独立顶层指令 |
 | 车友违规治理 | 关键词命中写入 `content_moderation_logs`；可选自动封号（`auto_ban_enabled` + 阈值） | 种子默认只拦不封，车主可开 |
 
 ## 二、部署
@@ -60,8 +60,10 @@ pnpm install --frozen-lockfile && pnpm run build
 
 ### 验证种子已生效
 
-> 注意：251 号种子采用 `ON CONFLICT (key) DO NOTHING` / `WHERE NOT EXISTS` 写入，
-> 只会补全缺失项，不会覆盖老实例中管理员已经手工保存过的配置。
+> 注意：251 号种子的大多数 settings 采用 `ON CONFLICT (key) DO NOTHING`，
+> 不会覆盖老实例中管理员已经手工保存过的配置；唯一例外是风险总开关
+> `risk_control_enabled`，使用 `ON CONFLICT (key) DO UPDATE` 强制回到 `true`，
+> 以修复早期 135 号迁移留下的 `false`。
 
 启动后用管理员登录，检查：
 
@@ -127,12 +129,14 @@ OpenAI 兼容端点，并把 `keyword_blocking_mode` 调回 `keyword_and_api`—
   - `backend/internal/handler/carpool_passthrough_empty_body_test.go`
 - 后端定制改动：
   - `backend/cmd/server/VERSION`
-  - `backend/internal/handler/openai_gateway_handler.go`（`applyOpenAIFailoverPassthroughRule` 允许空响应体命中状态码规则）
+  - `backend/internal/handler/openai_gateway_handler.go`（`applyOpenAIFailoverPassthroughRule` 允许空响应体命中状态码规则；OpenAI 账号处理 Anthropic Messages 时接入同一透传规则）
   - `backend/internal/handler/gateway_handler.go`（`matchFailoverPassthroughRule` 抽取共用逻辑并允许 failover 耗尽透传空响应体）
   - `backend/internal/handler/gateway_handler_responses.go`（Anthropic 组 `/v1/responses` failover 耗尽补充匹配透传规则）
-  - `backend/internal/handler/gateway_handler_chat_completions.go`（Anthropic/兼容组 `/v1/chat/completions` failover 耗尽补充匹配透传规则）
+  - `backend/internal/handler/gateway_handler_chat_completions.go`（Anthropic/兼容组 `/v1/chat/completions` failover 耗尽补充匹配透传规则；仅发心跳后补发错误帧与 `[DONE]`）
   - `backend/internal/handler/gemini_v1beta_handler.go`（Gemini failover 耗尽透传允许空响应体）
-  - `backend/internal/service/content_moderation_input.go`（`extractContentModerationKeywordText` 补充扫描 Responses `instructions`、Anthropic 顶层 `system`、Gemini `systemInstruction`/`system_instruction`、末尾 `system`/`developer` 项及空 `user` 附带指令载荷）
+  - `backend/internal/service/content_moderation.go`、`backend/internal/service/content_moderation_input.go`（新增 Embeddings 协议；关键词扫描所有客户端可控的 `system`/`developer`/`user` 文本、Responses `instructions`、Anthropic 顶层 `system`、Gemini `systemInstruction`/`system_instruction`；语义审核仍保持最新 `user` 行为）
+  - `backend/internal/service/openai_embeddings.go`、`backend/internal/handler/openai_embeddings.go`（非 failover 4xx 错误透传规则及协议接线）
+  - `backend/internal/service/openai_alpha_search.go`、`backend/internal/handler/openai_alpha_search.go`（独立 Alpha Search 与 Responses fallback 的非 failover 错误透传规则）
 - Go `1.27.4` 安全构建对齐（修复 CI/govulncheck 标准库告警，上游升级后可直接跟进）：
   - `backend/go.mod`、`Dockerfile`、`backend/Dockerfile`、`deploy/Dockerfile`、`.github/workflows/{backend-ci,security-scan,release}.yml`
 
@@ -142,10 +146,11 @@ OpenAI 兼容端点，并把 `keyword_blocking_mode` 调回 `keyword_and_api`—
 ## 五、已知边界
 
 - 关键词提取与匹配边界：
-  - 历史上下文、以及以 `assistant`/`model`/`tool`/`tool_result`/`functionResponse`/`function_call_output` 结尾的 Agent 工具循环轮次不会触发关键词拦截（保留上游设计，避免工具循环误伤）。
-  - 本地关键词已覆盖最新一轮 `user` 消息（含空文本附带系统指令场景）、Responses `instructions`、Anthropic 顶层 `system`、Gemini `systemInstruction`/`system_instruction` 及末尾 `system`/`developer` 项；匹配为大小写不敏感的子串匹配（`strings.Contains`），在后台追加短关键词时注意避免误伤正常语义。
+  - 本地关键词审核会全面扫描当前请求中客户端可控的所有 `system`/`developer`/`user` 消息文本，以及 OpenAI Responses `instructions`、Anthropic 顶层 `system`、Gemini `systemInstruction`/`system_instruction`；因此头部指令、中间历史 user、开头 user 和工具循环末尾的顶层指令都不会绕过拦截。
+  - `assistant`/`model`/`tool`/`tool_result`/`functionResponse`/`function_call_output` 等非客户端指令结果文本仍排除，避免把模型输出或工具回传误判为车友输入；语义审核的“最新 user”边界保持上游行为不变。Embeddings 同时检查 `input` 的单个字符串和字符串数组。
+  - 匹配为大小写不敏感的子串匹配（`strings.Contains`），在后台追加短关键词时注意避免误伤正常语义。
 - 上游报错伪装边界：
   - 所有预置 `carpool-mask-*` 规则默认统一改写为 `502` 与同一条通用文案，不对外区分上游错误类型；若后续希望放开 `429` 或 `400` 类原状态码，可在后台对应规则中开启「透传状态码」。
-  - 流式请求中上游**已开始输出后**的中断无法伪装（SSE 已发出 200），种子规则只覆盖响应头之前（或仅发出 keepalive 心跳未输出正文前）的失败——这也是上游所有反代的一致行为。
+  - 流式请求中上游**已开始输出正文后**的中断无法伪装（SSE 已发出 200），种子规则只覆盖响应头之前（或仅发出 keepalive 心跳未输出正文前）的失败；Chat Completions 在后者会补发错误帧和 `[DONE]`。
   - 空响应体且带 HTTP 状态码的上游失败现已可命中按状态码匹配的规则（含原生路由及 `/v1/responses`、`/v1/chat/completions` 兼容路由 failover 耗尽）；无 HTTP 状态码且无 `LastFailoverErr` 的本地调度/连接失败仍走通用 502 兜底文案。
   - OpenAI 凭据/访问态拒绝、过载降级（`IsOpenAICapacityShed`）、兼容模型不存在 400、静默拒绝以及 `cyber_policy` 硬阻断会在透传规则之前返回；Responses WebSocket 模式则使用内置脱敏关闭文案，不读取 `error_passthrough_rules`。

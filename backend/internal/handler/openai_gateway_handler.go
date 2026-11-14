@@ -1663,6 +1663,30 @@ func (h *OpenAIGatewayHandler) handleAnthropicFailoverExhausted(c *gin.Context, 
 		h.anthropicStreamingAwareError(c, status, "api_error", failoverErr.ClientMessage, streamStarted)
 		return
 	}
+	if failoverErr != nil && h.errorPassthroughService != nil {
+		rule := h.errorPassthroughService.MatchRule(
+			service.PlatformOpenAI,
+			failoverErr.StatusCode,
+			failoverErr.ResponseBody,
+		)
+		if rule != nil {
+			status := failoverErr.StatusCode
+			if !rule.PassthroughCode && rule.ResponseCode != nil {
+				status = *rule.ResponseCode
+			}
+			message := service.ExtractUpstreamErrorMessage(failoverErr.ResponseBody)
+			if !rule.PassthroughBody && rule.CustomMessage != nil {
+				message = *rule.CustomMessage
+			} else if strings.TrimSpace(message) == "" {
+				_, _, message = h.mapUpstreamError(failoverErr.StatusCode)
+			}
+			if rule.SkipMonitoring {
+				c.Set(service.OpsSkipPassthroughKey, true)
+			}
+			h.anthropicStreamingAwareError(c, status, "upstream_error", message, streamStarted)
+			return
+		}
+	}
 	status, errType, errMsg := h.mapUpstreamError(failoverErr.StatusCode)
 	h.anthropicStreamingAwareError(c, status, errType, errMsg, streamStarted)
 }

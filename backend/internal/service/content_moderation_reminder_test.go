@@ -125,7 +125,11 @@ func TestExtractContentModerationKeywordText_Boundaries(t *testing.T) {
 		{ContentModerationProtocolGemini, `{"contents":[{"role":"user","parts":[{"text":"old"}]},{"role":"model","parts":[{"text":"今晚打老虎"}]}]}`},
 	} {
 		t.Run(tc.protocol+tc.body, func(t *testing.T) {
-			require.Empty(t, extractContentModerationKeywordText(tc.protocol, []byte(tc.body)))
+			keywordText := extractContentModerationKeywordText(tc.protocol, []byte(tc.body))
+			// Keyword moderation now scans all client-controlled user turns, so
+			// safe history may remain in the extracted text. Tool/assistant/model
+			// payloads themselves must still not introduce the keyword.
+			require.NotContains(t, keywordText, "今晚打老虎")
 		})
 	}
 }
