@@ -186,6 +186,7 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 
 	// 3. Account selection + failover loop
 	fs := NewFailoverState(h.maxAccountSwitches, false)
+	lastFailoverPlatform := service.PlatformAnthropic
 
 	for {
 		if failoverClientGone(c) {
@@ -219,7 +220,7 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 				return
 			default:
 				if fs.LastFailoverErr != nil {
-					h.handleResponsesFailoverExhausted(c, fs.LastFailoverErr, streamStarted)
+					h.handleResponsesFailoverExhaustedWithPlatform(c, fs.LastFailoverErr, lastFailoverPlatform, streamStarted)
 				} else {
 					h.responsesErrorResponse(c, http.StatusBadGateway, "server_error", "All available accounts exhausted")
 				}
@@ -345,9 +346,10 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 		if err != nil {
 			var failoverErr *service.UpstreamFailoverError
 			if errors.As(err, &failoverErr) {
+				lastFailoverPlatform = account.Platform
 				// Can't failover if streaming content already sent
 				if c.Writer.Size() != writerSizeBeforeForward {
-					h.handleResponsesFailoverExhausted(c, failoverErr, true)
+					h.handleResponsesFailoverExhaustedWithPlatform(c, failoverErr, account.Platform, true)
 					return
 				}
 				action := fs.HandleFailoverError(requestCtx, h.gatewayService, account.ID, account.Platform, account.GetPoolModeRetryCount(), failoverErr)
@@ -355,7 +357,7 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 				case FailoverContinue:
 					continue
 				case FailoverExhausted:
-					h.handleResponsesFailoverExhausted(c, fs.LastFailoverErr, streamStarted)
+					h.handleResponsesFailoverExhaustedWithPlatform(c, fs.LastFailoverErr, lastFailoverPlatform, streamStarted)
 					return
 				case FailoverCanceled:
 					failoverClientGone(c)
@@ -397,6 +399,10 @@ func (h *GatewayHandler) responsesErrorResponse(c *gin.Context, status int, code
 
 // handleResponsesFailoverExhausted writes a failover-exhausted error in Responses format.
 func (h *GatewayHandler) handleResponsesFailoverExhausted(c *gin.Context, lastErr *service.UpstreamFailoverError, streamStarted bool) {
+	h.handleResponsesFailoverExhaustedWithPlatform(c, lastErr, service.PlatformAnthropic, streamStarted)
+}
+
+func (h *GatewayHandler) handleResponsesFailoverExhaustedWithPlatform(c *gin.Context, lastErr *service.UpstreamFailoverError, platform string, streamStarted bool) {
 	if lastErr != nil {
 		copyFailoverRetryAfter(c, lastErr.ResponseHeaders)
 	}
@@ -416,6 +422,8 @@ func (h *GatewayHandler) handleResponsesFailoverExhausted(c *gin.Context, lastEr
 	} else if lastErr != nil && service.IsOpenAISilentRefusalErrorBody(lastErr.ResponseBody) {
 		service.SetOpsUpstreamError(c, statusCode, service.OpenAISilentRefusalClientMessage(), "")
 		status, code, message = http.StatusBadGateway, "upstream_error", service.OpenAISilentRefusalClientMessage()
+	} else if respCode, ptMsg, matched := h.matchFailoverPassthroughRule(c, platform, lastErr, "All available accounts exhausted"); matched {
+		status, code, message = respCode, "upstream_error", ptMsg
 	} else if lastErr != nil && statusCode == http.StatusTooManyRequests {
 		status, code, message = http.StatusTooManyRequests, "rate_limit_error", "All available accounts are currently rate-limited. Please retry later."
 	}

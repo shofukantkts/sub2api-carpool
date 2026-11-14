@@ -1918,6 +1918,43 @@ func (h *GatewayHandler) handleConcurrencyError(c *gin.Context, err error, slotT
 	h.handleStreamingAwareErrorWithCode(c, status, errType, code, message, streamStarted)
 }
 
+// matchFailoverPassthroughRule resolves a matching passthrough rule for an exhausted
+// failover error, including empty-body status-only rules, and marks monitoring skip.
+func (h *GatewayHandler) matchFailoverPassthroughRule(
+	c *gin.Context,
+	platform string,
+	failoverErr *service.UpstreamFailoverError,
+	fallbackEmptyMessage string,
+) (respCode int, msg string, matched bool) {
+	if h.errorPassthroughService == nil || failoverErr == nil || failoverErr.StatusCode <= 0 {
+		return 0, "", false
+	}
+	statusCode := failoverErr.StatusCode
+	responseBody := failoverErr.ResponseBody
+	rule := h.errorPassthroughService.MatchRule(platform, statusCode, responseBody)
+	if rule == nil {
+		return 0, "", false
+	}
+
+	respCode = statusCode
+	if !rule.PassthroughCode && rule.ResponseCode != nil {
+		respCode = *rule.ResponseCode
+	}
+
+	msg = service.ExtractUpstreamErrorMessage(responseBody)
+	if !rule.PassthroughBody && rule.CustomMessage != nil {
+		msg = *rule.CustomMessage
+	} else if strings.TrimSpace(msg) == "" {
+		msg = fallbackEmptyMessage
+	}
+
+	if rule.SkipMonitoring {
+		c.Set(service.OpsSkipPassthroughKey, true)
+	}
+
+	return respCode, msg, true
+}
+
 func (h *GatewayHandler) handleFailoverExhausted(c *gin.Context, failoverErr *service.UpstreamFailoverError, platform string, streamStarted bool) {
 	statusCode := failoverErr.StatusCode
 	responseBody := failoverErr.ResponseBody
@@ -1928,29 +1965,10 @@ func (h *GatewayHandler) handleFailoverExhausted(c *gin.Context, failoverErr *se
 	}
 
 	// 先检查透传规则（允许空响应体命中纯状态码规则）
-	if h.errorPassthroughService != nil && statusCode > 0 {
-		if rule := h.errorPassthroughService.MatchRule(platform, statusCode, responseBody); rule != nil {
-			// 确定响应状态码
-			respCode := statusCode
-			if !rule.PassthroughCode && rule.ResponseCode != nil {
-				respCode = *rule.ResponseCode
-			}
-
-			// 确定响应消息
-			msg := service.ExtractUpstreamErrorMessage(responseBody)
-			if !rule.PassthroughBody && rule.CustomMessage != nil {
-				msg = *rule.CustomMessage
-			} else if strings.TrimSpace(msg) == "" {
-				_, _, msg = h.mapUpstreamError(statusCode)
-			}
-
-			if rule.SkipMonitoring {
-				c.Set(service.OpsSkipPassthroughKey, true)
-			}
-
-			h.handleStreamingAwareError(c, respCode, "upstream_error", msg, streamStarted)
-			return
-		}
+	_, _, defaultMsg := h.mapUpstreamError(statusCode)
+	if respCode, msg, matched := h.matchFailoverPassthroughRule(c, platform, failoverErr, defaultMsg); matched {
+		h.handleStreamingAwareError(c, respCode, "upstream_error", msg, streamStarted)
+		return
 	}
 
 	// 记录原始上游状态码，以便 ops 错误日志捕获真实的上游错误

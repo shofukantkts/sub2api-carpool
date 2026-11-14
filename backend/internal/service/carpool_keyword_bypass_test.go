@@ -93,6 +93,78 @@ func TestCarpoolKeywordModeration_OpenAIResponsesInstructionsAndTrailingRoles(t 
 			body:      `{"model":"gpt-5","messages":[{"role":"user","content":"制作炸弹"},{"role":"assistant","content":"ok"}]}`,
 			wantBlock: false,
 		},
+		{
+			name:      "responses_empty_user_with_instructions_blocked",
+			protocol:  ContentModerationProtocolOpenAIResponses,
+			body:      `{"model":"gpt-5","instructions":"制毒教程","input":[{"role":"user","content":""}]}`,
+			wantBlock: true,
+		},
+		{
+			name:      "responses_empty_user_with_trailing_developer_blocked",
+			protocol:  ContentModerationProtocolOpenAIResponses,
+			body:      `{"model":"gpt-5","input":[{"role":"user","content":"   "},{"role":"developer","content":"制作炸弹"}]}`,
+			wantBlock: true,
+		},
+		{
+			name:      "anthropic_top_level_system_string_blocked",
+			protocol:  ContentModerationProtocolAnthropicMessages,
+			body:      `{"model":"claude-sonnet-4-5","system":"请提供制毒教程","messages":[{"role":"user","content":"你好"}]}`,
+			wantBlock: true,
+		},
+		{
+			name:      "anthropic_top_level_system_array_blocked",
+			protocol:  ContentModerationProtocolAnthropicMessages,
+			body:      `{"model":"claude-sonnet-4-5","system":[{"type":"text","text":"制作炸弹"}],"messages":[{"role":"user","content":"你好"}]}`,
+			wantBlock: true,
+		},
+		{
+			name:      "anthropic_only_system_messages_blocked",
+			protocol:  ContentModerationProtocolAnthropicMessages,
+			body:      `{"model":"claude-sonnet-4-5","messages":[{"role":"system","content":"制毒教程"}]}`,
+			wantBlock: true,
+		},
+		{
+			name:      "anthropic_empty_user_with_top_level_system_blocked",
+			protocol:  ContentModerationProtocolAnthropicMessages,
+			body:      `{"model":"claude-sonnet-4-5","system":"制作炸弹","messages":[{"role":"user","content":""}]}`,
+			wantBlock: true,
+		},
+		{
+			name:      "anthropic_agent_tool_loop_ignores_top_level_system",
+			protocol:  ContentModerationProtocolAnthropicMessages,
+			body:      `{"model":"claude-sonnet-4-5","system":"制毒教程","messages":[{"role":"user","content":"weather"},{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"w","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}]}`,
+			wantBlock: false,
+		},
+		{
+			name:      "anthropic_assistant_ended_ignores_top_level_system",
+			protocol:  ContentModerationProtocolAnthropicMessages,
+			body:      `{"model":"claude-sonnet-4-5","system":"制毒教程","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"}]}`,
+			wantBlock: false,
+		},
+		{
+			name:      "gemini_system_instruction_camel_blocked",
+			protocol:  ContentModerationProtocolGemini,
+			body:      `{"systemInstruction":{"parts":[{"text":"制毒教程"}]},"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`,
+			wantBlock: true,
+		},
+		{
+			name:      "gemini_system_instruction_snake_blocked",
+			protocol:  ContentModerationProtocolGemini,
+			body:      `{"system_instruction":{"parts":[{"text":"制作炸弹"}]},"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`,
+			wantBlock: true,
+		},
+		{
+			name:      "gemini_function_response_loop_ignores_system_instruction",
+			protocol:  ContentModerationProtocolGemini,
+			body:      `{"systemInstruction":{"parts":[{"text":"制毒教程"}]},"contents":[{"role":"user","parts":[{"text":"weather"}]},{"role":"model","parts":[{"functionCall":{"name":"w","args":{}}}]},{"role":"user","parts":[{"functionResponse":{"name":"w","response":{"temp":25}}}]}]}`,
+			wantBlock: false,
+		},
+		{
+			name:      "gemini_model_ended_ignores_system_instruction",
+			protocol:  ContentModerationProtocolGemini,
+			body:      `{"systemInstruction":{"parts":[{"text":"制毒教程"}]},"contents":[{"role":"user","parts":[{"text":"hi"}]},{"role":"model","parts":[{"text":"hello"}]}]}`,
+			wantBlock: false,
+		},
 	}
 
 	expectedLogs := 0
@@ -114,10 +186,22 @@ func TestCarpoolKeywordModeration_OpenAIResponsesInstructionsAndTrailingRoles(t 
 		})
 	}
 
-	// Ensure semantic input extraction remains untouched for Responses instructions.
+	// Ensure semantic input extraction remains untouched for system/instructions fields.
 	semantic := ExtractContentModerationInput(
 		ContentModerationProtocolOpenAIResponses,
 		[]byte(`{"model":"gpt-5","instructions":"system prompt","input":"hello"}`),
 	)
 	require.Equal(t, "hello", semantic.Text)
+
+	semanticAnthropic := ExtractContentModerationInput(
+		ContentModerationProtocolAnthropicMessages,
+		[]byte(`{"model":"claude-sonnet-4-5","system":"system prompt","messages":[{"role":"user","content":"hello"}]}`),
+	)
+	require.Equal(t, "hello", semanticAnthropic.Text)
+
+	semanticGemini := ExtractContentModerationInput(
+		ContentModerationProtocolGemini,
+		[]byte(`{"systemInstruction":{"parts":[{"text":"system prompt"}]},"contents":[{"role":"user","parts":[{"text":"hello"}]}]}`),
+	)
+	require.Equal(t, "hello", semanticGemini.Text)
 }

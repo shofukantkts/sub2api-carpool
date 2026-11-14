@@ -107,4 +107,91 @@ func TestCarpoolFailoverExhausted_EmptyBodyMatchesStatusRule(t *testing.T) {
 		require.Equal(t, http.StatusBadGateway, rec.Code)
 		require.Contains(t, rec.Body.String(), "上游服务暂时不可用，请稍后重试")
 	})
+
+	t.Run("gateway_responses_failover_exhausted_matches_rule", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil))
+
+		repo := &errorPassthroughRepoStub{rules: []*model.ErrorPassthroughRule{newCarpoolMask502Rule()}}
+		h := &GatewayHandler{
+			errorPassthroughService: service.NewErrorPassthroughService(repo, nil),
+		}
+		h.handleResponsesFailoverExhausted(c, &service.UpstreamFailoverError{
+			StatusCode:   http.StatusBadGateway,
+			ResponseBody: nil,
+		}, false)
+
+		require.Equal(t, http.StatusBadGateway, rec.Code)
+		var envelope map[string]any
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &envelope))
+		errObj, ok := envelope["error"].(map[string]any)
+		require.True(t, ok)
+		require.Equal(t, "upstream_error", errObj["code"])
+		require.Equal(t, "上游服务暂时不可用，请稍后重试", errObj["message"])
+	})
+
+	t.Run("gateway_responses_failover_exhausted_sse_matches_rule", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil))
+		written, err := rec.WriteString(": keepalive\n\n")
+		require.NoError(t, err)
+		recordGatewayStreamHeartbeat(c, written)
+
+		repo := &errorPassthroughRepoStub{rules: []*model.ErrorPassthroughRule{newCarpoolMask502Rule()}}
+		h := &GatewayHandler{
+			errorPassthroughService: service.NewErrorPassthroughService(repo, nil),
+		}
+		h.handleResponsesFailoverExhausted(c, &service.UpstreamFailoverError{
+			StatusCode:   http.StatusBadGateway,
+			ResponseBody: nil,
+		}, true)
+
+		require.Contains(t, rec.Body.String(), `"type":"response.failed"`)
+		require.Contains(t, rec.Body.String(), "上游服务暂时不可用，请稍后重试")
+	})
+
+	t.Run("gateway_responses_credential_failure_not_overridden", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil))
+
+		repo := &errorPassthroughRepoStub{rules: []*model.ErrorPassthroughRule{newCarpoolMask502Rule()}}
+		h := &GatewayHandler{
+			errorPassthroughService: service.NewErrorPassthroughService(repo, nil),
+		}
+		h.handleResponsesFailoverExhausted(c, &service.UpstreamFailoverError{
+			StatusCode:   http.StatusBadGateway,
+			ResponseBody: []byte("invalid token"),
+			Stage:        service.GatewayFailureStageAccountAuth,
+			Reason:       service.AntigravityCredentialRejectedReason,
+		}, false)
+
+		require.Equal(t, http.StatusBadGateway, rec.Code)
+		require.Contains(t, rec.Body.String(), service.AntigravityCredentialRejectedClientMessage)
+	})
+
+	t.Run("gateway_cc_failover_exhausted_matches_rule", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(nil))
+
+		repo := &errorPassthroughRepoStub{rules: []*model.ErrorPassthroughRule{newCarpoolMask502Rule()}}
+		h := &GatewayHandler{
+			errorPassthroughService: service.NewErrorPassthroughService(repo, nil),
+		}
+		h.handleCCFailoverExhausted(c, &service.UpstreamFailoverError{
+			StatusCode:   http.StatusBadGateway,
+			ResponseBody: nil,
+		}, false)
+
+		require.Equal(t, http.StatusBadGateway, rec.Code)
+		var envelope map[string]any
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &envelope))
+		errObj, ok := envelope["error"].(map[string]any)
+		require.True(t, ok)
+		require.Equal(t, "upstream_error", errObj["type"])
+		require.Equal(t, "上游服务暂时不可用，请稍后重试", errObj["message"])
+	})
 }

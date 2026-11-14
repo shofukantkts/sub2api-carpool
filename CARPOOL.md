@@ -1,8 +1,8 @@
 # Sub2API 拼车（GPT Pro 20X 车主/车友）定制说明
 
 本仓库是 `Wei-Shaw/sub2api` 的拼车场景定制版。核心能力来自上游内置实现，并在此基础上
-补充了**种子迁移 + 少量后端防护补丁**（空响应体错误透传、Responses `instructions` 与末尾
-`system`/`developer` 关键词拦截），前端代码零改动。
+补充了**种子迁移 + 少量后端防护补丁**（空响应体错误透传及兼容路由 failover 兜底覆盖、
+全协议 system/instructions 与末尾 `system`/`developer` 关键词拦截），前端代码零改动。
 
 - 定制种子：`backend/migrations/251_carpool_seed.sql`（服务启动时自动执行，幂等）
 - 种子与补丁测试：`backend/migrations/251_carpool_seed_test.go`、`backend/internal/service/carpool_keyword_bypass_test.go`、`backend/internal/handler/carpool_passthrough_empty_body_test.go`
@@ -29,6 +29,7 @@ mkdir -p sub2api-deploy && cd sub2api-deploy
 # 2. 用本仓库的 compose 文件与 .env（或按官方 docker-deploy.sh 生成）
 cp /path/to/this-repo/deploy/docker-compose.local.yml docker-compose.yml
 cp /path/to/this-repo/deploy/.env.example .env
+mkdir -p data postgres_data redis_data
 # 编辑 .env：POSTGRES_PASSWORD / JWT_SECRET / TOTP_ENCRYPTION_KEY 必填
 #   openssl rand -hex 32  生成上述三个值
 
@@ -116,7 +117,7 @@ OpenAI 兼容端点，并把 `keyword_blocking_mode` 调回 `keyword_and_api`—
 
 ## 四、与上游同步
 
-定制包含以下新增与微调文件，rebase 上游 `main` 时仅需留意 4 个 Go 源码小改点：
+定制包含以下新增与微调文件，rebase 上游 `main` 时仅需留意后端小改点与工具链文件：
 
 - 新增文件：
   - `CARPOOL.md`
@@ -124,12 +125,16 @@ OpenAI 兼容端点，并把 `keyword_blocking_mode` 调回 `keyword_and_api`—
   - `backend/migrations/251_carpool_seed_test.go`
   - `backend/internal/service/carpool_keyword_bypass_test.go`
   - `backend/internal/handler/carpool_passthrough_empty_body_test.go`
-- 修改文件：
+- 后端定制改动：
   - `backend/cmd/server/VERSION`
   - `backend/internal/handler/openai_gateway_handler.go`（`applyOpenAIFailoverPassthroughRule` 允许空响应体命中状态码规则）
-  - `backend/internal/handler/gateway_handler.go`（failover 耗尽透传允许空响应体）
+  - `backend/internal/handler/gateway_handler.go`（`matchFailoverPassthroughRule` 抽取共用逻辑并允许 failover 耗尽透传空响应体）
+  - `backend/internal/handler/gateway_handler_responses.go`（Anthropic 组 `/v1/responses` failover 耗尽补充匹配透传规则）
+  - `backend/internal/handler/gateway_handler_chat_completions.go`（Anthropic/兼容组 `/v1/chat/completions` failover 耗尽补充匹配透传规则）
   - `backend/internal/handler/gemini_v1beta_handler.go`（Gemini failover 耗尽透传允许空响应体）
-  - `backend/internal/service/content_moderation_input.go`（`extractContentModerationKeywordText` 补充扫描 Responses `instructions` 与末尾 `system`/`developer` 项）
+  - `backend/internal/service/content_moderation_input.go`（`extractContentModerationKeywordText` 补充扫描 Responses `instructions`、Anthropic 顶层 `system`、Gemini `systemInstruction`/`system_instruction`、末尾 `system`/`developer` 项及空 `user` 附带指令载荷）
+- Go `1.27.4` 安全构建对齐（修复 CI/govulncheck 标准库告警，上游升级后可直接跟进）：
+  - `backend/go.mod`、`Dockerfile`、`backend/Dockerfile`、`deploy/Dockerfile`、`.github/workflows/{backend-ci,security-scan,release}.yml`
 
 > 注意：迁移文件有 SHA256 校验。如果未来你手工改了已在线上环境执行过的 251 号种子，
 > 会触发 checksum mismatch；正确做法是改关键词走管理后台（settings 表），或新增 252 号迁移。
@@ -137,10 +142,10 @@ OpenAI 兼容端点，并把 `keyword_blocking_mode` 调回 `keyword_and_api`—
 ## 五、已知边界
 
 - 关键词提取与匹配边界：
-  - 历史上下文、以及以 `assistant`/`tool`/`function_call_output` 结尾的 Agent 工具循环轮次不会触发关键词拦截（保留上游设计，避免工具循环误伤）。
-  - 本地关键词已覆盖最新一轮 `user` 消息、Responses `instructions`（非工具循环时）及紧随 `user` 后的末尾 `system`/`developer` 项；匹配为大小写不敏感的子串匹配（`strings.Contains`），在后台追加短关键词时注意避免误伤正常语义。
+  - 历史上下文、以及以 `assistant`/`model`/`tool`/`tool_result`/`functionResponse`/`function_call_output` 结尾的 Agent 工具循环轮次不会触发关键词拦截（保留上游设计，避免工具循环误伤）。
+  - 本地关键词已覆盖最新一轮 `user` 消息（含空文本附带系统指令场景）、Responses `instructions`、Anthropic 顶层 `system`、Gemini `systemInstruction`/`system_instruction` 及末尾 `system`/`developer` 项；匹配为大小写不敏感的子串匹配（`strings.Contains`），在后台追加短关键词时注意避免误伤正常语义。
 - 上游报错伪装边界：
   - 400 类确定性错误默认保留状态码（客户端需要知道参数错在哪）。若想连 400 也完全统一成 502，在后台把 `carpool-mask-400` 的「透传状态码」关掉并填 502 即可。
-  - 流式请求中上游**已开始输出后**的中断无法伪装（SSE 已发出 200），种子规则只覆盖响应头之前的失败——这也是上游所有反代的一致行为。
-  - 空响应体且带 HTTP 状态码的上游失败现已可命中按状态码匹配的规则；但无 HTTP 状态码的网络超时/连接断开仍不会命中状态码规则。
-  - OpenAI 凭据/访问态拒绝、过载降级（`IsOpenAICapacityShed`）、兼容模型不存在 400 以及 `cyber_policy` 硬阻断会在透传规则之前返回；Responses WebSocket 模式则使用内置脱敏关闭文案，不读取 `error_passthrough_rules`。
+  - 流式请求中上游**已开始输出后**的中断无法伪装（SSE 已发出 200），种子规则只覆盖响应头之前（或仅发出 keepalive 心跳未输出正文前）的失败——这也是上游所有反代的一致行为。
+  - 空响应体且带 HTTP 状态码的上游失败现已可命中按状态码匹配的规则（含原生路由及 `/v1/responses`、`/v1/chat/completions` 兼容路由 failover 耗尽）；无 HTTP 状态码且无 `LastFailoverErr` 的本地调度/连接失败仍走通用 502 兜底文案。
+  - OpenAI 凭据/访问态拒绝、过载降级（`IsOpenAICapacityShed`）、兼容模型不存在 400、静默拒绝以及 `cyber_policy` 硬阻断会在透传规则之前返回；Responses WebSocket 模式则使用内置脱敏关闭文案，不读取 `error_passthrough_rules`。
