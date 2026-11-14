@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Wei-Shaw/sub2api/internal/model"
 	"github.com/stretchr/testify/require"
 )
 
@@ -81,6 +82,21 @@ func TestCarpoolSeed_ContentModerationConfig(t *testing.T) {
 	require.NotEmpty(t, strings.TrimSpace(cfg.BlockMessage))
 	require.False(t, cfg.AutoBanEnabled, "carpool seed blocks without auto-ban")
 	require.Equal(t, "all", cfg.ModelFilter.Type)
+
+	// 回归校验：避免短子串误伤正常医学、农牧、二次元语境。
+	benignSamples := []string{
+		"请解释如何抑制毒素分泌",
+		"需要控制毒性反应",
+		"白羽肉鸡的养殖周期是多少",
+		"cp资源是什么意思",
+	}
+	for _, sample := range benignSamples {
+		lowerSample := strings.ToLower(sample)
+		for _, kw := range cfg.BlockedKeywords {
+			require.NotContains(t, lowerSample, strings.ToLower(kw),
+				"benign phrase %q must not match keyword %q", sample, kw)
+		}
+	}
 }
 
 // TestCarpoolSeed_RiskControlEnabledOn 校验总开关与车友错误页开关的种子值。
@@ -89,111 +105,114 @@ func TestCarpoolSeed_RiskControlEnabledOn(t *testing.T) {
 	require.Equal(t, "false", carpoolSettingValue(t, "allow_user_view_error_requests"))
 }
 
-// carpoolRuleRow 是 error_passthrough_rules 的一个种子行（解析结果）。
-type carpoolRuleRow struct {
-	Name            string
-	Priority        int
-	ErrorCodes      []int
-	MatchMode       string
-	PassthroughCode bool
-	ResponseCode    *int
-	PassthroughBody bool
-	CustomMessage   string
-	SkipMonitoring  bool
-}
-
-// parseCarpoolRuleRows 按种子文件的固定列序解析 INSERT 行。
-// 列序与 251_carpool_seed.sql 的 INSERT 列清单一一对应：
+// parseCarpoolRuleRows 按种子文件的固定列序解析 INSERT ... FROM (VALUES ...) 行，
+// 并直接构造 model.ErrorPassthroughRule，供 Validate() 校验。
+// 列序与 251_carpool_seed.sql 的 VALUES 列清单一一对应：
 // (name, enabled, priority, error_codes, keywords, match_mode,
 //  platforms, passthrough_code, response_code, passthrough_body,
-//  custom_message, skip_monitoring, description, updated_at)
-func parseCarpoolRuleRows(t *testing.T) []carpoolRuleRow {
+//  custom_message, skip_monitoring, description)
+func parseCarpoolRuleRows(t *testing.T) []*model.ErrorPassthroughRule {
 	t.Helper()
 	raw := carpoolSeedSQL(t)
 	start := strings.Index(raw, "INSERT INTO error_passthrough_rules")
 	require.True(t, start >= 0, "seed must insert error_passthrough_rules")
 	block := raw[start:]
-	end := strings.Index(block, "ON CONFLICT DO NOTHING;")
-	require.True(t, end >= 0, "rules INSERT must end with ON CONFLICT DO NOTHING")
-	block = block[:end]
+	// error_passthrough_rules 在 name 上无唯一约束，必须用 WHERE NOT EXISTS 保证幂等。
+	require.NotContains(t, block, "ON CONFLICT", "error_passthrough_rules must not rely on ON CONFLICT without a unique constraint")
+	require.Contains(t, block, "WHERE NOT EXISTS", "error_passthrough_rules must deduplicate via WHERE NOT EXISTS")
 
-	// 按 VALUES 行拆分：先折叠空白，再按 "以字符串感知的右括号" 切元组。
-	// "VALUES (" 的左括号开启第一个元组；每行收尾于 ")，" 或最末 ")"。
-	collapsed := strings.Join(strings.Fields(block), " ")
-	valIdx := strings.Index(collapsed, "VALUES (")
-	require.True(t, valIdx >= 0, "rules INSERT must contain VALUES (")
-	tuplesOnly := collapsed[valIdx+len("VALUES ("):]
+	valStart := strings.Index(block, "VALUES")
+	require.True(t, valStart >= 0, "rules INSERT must contain VALUES")
+	asVEnd := strings.Index(block[valStart:], ") AS v")
+	require.True(t, asVEnd >= 0, "rules VALUES block must close with ) AS v")
+	tuplesOnly := strings.TrimSpace(block[valStart+len("VALUES") : valStart+asVEnd])
+
 	var rawTuples []string
-	buf, inString := strings.Builder{}, false
+	var buf strings.Builder
+	inString := false
+	depth := 0
 	for i := 0; i < len(tuplesOnly); i++ {
 		c := tuplesOnly[i]
 		if c == '\'' {
-			inString = !inString
 			buf.WriteByte(c)
+			// 处理 SQL 单引号转义 ''
+			if inString && i+1 < len(tuplesOnly) && tuplesOnly[i+1] == '\'' {
+				buf.WriteByte(tuplesOnly[i+1])
+				i++
+				continue
+			}
+			inString = !inString
 			continue
 		}
-		if !inString && c == ')' {
-			// 元组内有嵌套括号（NOW()）。右括号只有在「其后为 ", (" 或结尾」时
-			// 才是元组收尾；NOW() 的右括号后面直接跟元组收尾 ")" 或内容。
-			after := tuplesOnly[i+1:]
-			trimmed := strings.TrimSpace(after)
-			isTupleClose := strings.HasPrefix(trimmed, ", (") || trimmed == "" ||
-				strings.HasPrefix(trimmed, "ON CONFLICT") ||
-				(!strings.HasSuffix(trimmed[:min(1, len(trimmed))], ")") && strings.HasPrefix(after, " )"))
-			if !isTupleClose {
-				buf.WriteByte(c)
-				continue
+		if !inString {
+			switch c {
+			case '(':
+				if depth == 0 {
+					buf.Reset()
+					depth = 1
+					continue
+				}
+				depth++
+			case ')':
+				depth--
+				if depth == 0 {
+					rawTuples = append(rawTuples, buf.String())
+					buf.Reset()
+					continue
+				}
 			}
-			rawTuples = append(rawTuples, buf.String())
-			buf.Reset()
-			if strings.HasPrefix(trimmed, ", (") {
-				nextOpen := strings.Index(after, "(")
-				i += 1 + nextOpen
-				continue
-			}
-			break
 		}
-		buf.WriteByte(c)
+		if depth > 0 {
+			buf.WriteByte(c)
+		}
 	}
-	var rows []carpoolRuleRow
+	require.Equal(t, 0, depth, "unbalanced parentheses in VALUES block")
+
+	var rows []*model.ErrorPassthroughRule
 	for _, tuple := range rawTuples {
 		fields, err := splitSQLTuple(tuple)
 		require.NoError(t, err, "row: %s", tuple)
-		require.Len(t, fields, 14, "expected 14 columns per rule row, got %d for %q", len(fields), tuple)
+		require.Len(t, fields, 13, "expected 13 columns per VALUES row, got %d for %q", len(fields), tuple)
 
-		rule := carpoolRuleRow{
+		customMsg := sqlString(t, fields[10])
+		desc := sqlString(t, fields[12])
+		rule := &model.ErrorPassthroughRule{
 			Name:          sqlString(t, fields[0]),
+			Enabled:       parseSQLBool(t, fields[1]),
+			Priority:      mustAtoi(t, fields[2]),
 			MatchMode:     sqlString(t, fields[5]),
-			CustomMessage: sqlString(t, fields[10]),
+			CustomMessage: &customMsg,
+			Description:   &desc,
 		}
 		require.NoError(t, json.Unmarshal([]byte(jsonbLiteral(t, fields[3])), &rule.ErrorCodes))
-		require.Equal(t, "'[]'::jsonb", fields[4], "seed rules never rely on keyword matching")
-		rule.Priority = mustAtoi(t, fields[2])
+		require.NoError(t, json.Unmarshal([]byte(jsonbLiteral(t, fields[4])), &rule.Keywords))
+		require.Empty(t, rule.Keywords, "seed rules never rely on keyword matching")
+		require.NoError(t, json.Unmarshal([]byte(jsonbLiteral(t, fields[6])), &rule.Platforms))
+		rule.PassthroughCode = parseSQLBool(t, fields[7])
+		rule.PassthroughBody = parseSQLBool(t, fields[9])
+		rule.SkipMonitoring = parseSQLBool(t, fields[11])
 
-		// 列序（见 251_carpool_seed.sql 的 INSERT 列清单）：
-		// 0 name, 1 enabled, 2 priority, 3 error_codes, 4 keywords, 5 match_mode,
-		// 6 platforms, 7 passthrough_code, 8 response_code, 9 passthrough_body,
-		// 10 custom_message, 11 skip_monitoring, 12 description, 13 updated_at
-		switch fields[7] {
-		case "TRUE", "true":
-			rule.PassthroughCode = true
-		}
-		switch fields[9] {
-		case "TRUE", "true":
-			rule.PassthroughBody = true
-		}
-		switch fields[11] {
-		case "TRUE", "true":
-			rule.SkipMonitoring = true
-		}
-		if fields[8] != "NULL" {
-			code := mustAtoi(t, fields[8])
+		if codeField := strings.TrimSuffix(fields[8], "::integer"); codeField != "NULL" {
+			code := mustAtoi(t, codeField)
 			rule.ResponseCode = &code
 		}
 
 		rows = append(rows, rule)
 	}
 	return rows
+}
+
+func parseSQLBool(t *testing.T, s string) bool {
+	t.Helper()
+	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case "TRUE":
+		return true
+	case "FALSE":
+		return false
+	default:
+		t.Fatalf("not a SQL boolean literal: %q", s)
+		return false
+	}
 }
 
 // splitSQLTuple 按顶层逗号切分一个 SQL 元组内容（括号已剥离）。
@@ -253,44 +272,44 @@ func TestCarpoolSeed_ErrorPassthroughRules(t *testing.T) {
 	require.Len(t, rules, 4, "seed ships exactly 4 masking rules")
 
 	for _, rule := range rules {
-		// Validate：name 必填、match_mode 合法、至少一个匹配条件、
-		// passthrough_code=false 时 response_code 必填、
-		// passthrough_body=false 时 custom_message 必填。
-		require.NotEmpty(t, rule.Name)
-		require.Equal(t, "any", rule.MatchMode)
+		require.NoError(t, rule.Validate(), "rule %s must pass model.ErrorPassthroughRule.Validate", rule.Name)
+		require.True(t, rule.Enabled, "rule %s must be enabled", rule.Name)
+		require.Equal(t, model.MatchModeAny, rule.MatchMode)
+		require.Empty(t, rule.Platforms, "rule %s applies to all platforms", rule.Name)
 		require.NotEmpty(t, rule.ErrorCodes, "rule %s must match by status codes", rule.Name)
-		require.NotEmpty(t, strings.TrimSpace(rule.CustomMessage), "rule %s must carry a masking message", rule.Name)
+		require.NotNil(t, rule.CustomMessage)
+		require.NotEmpty(t, strings.TrimSpace(*rule.CustomMessage), "rule %s must carry a masking message", rule.Name)
 		require.False(t, rule.PassthroughBody, "rule %s must never pass through upstream body", rule.Name)
 		require.False(t, rule.SkipMonitoring, "rule %s keeps ops records for the owner", rule.Name)
-
-		if !rule.PassthroughCode {
-			require.NotNil(t, rule.ResponseCode, "rule %s rewrites status", rule.Name)
-			require.Greater(t, *rule.ResponseCode, 0)
-		}
 	}
 
 	// 语义断言：凭据类(401/402/403)与 5xx 一律改写为 502，
 	// 429/400 类保留状态码但改写文案。
-	byName := map[string]carpoolRuleRow{}
+	byName := map[string]*model.ErrorPassthroughRule{}
 	for _, r := range rules {
 		byName[r.Name] = r
 	}
 	mask5xx := byName["carpool-mask-5xx"]
+	require.NotNil(t, mask5xx)
 	require.Equal(t, []int{500, 502, 503, 504, 529}, mask5xx.ErrorCodes)
 	require.False(t, mask5xx.PassthroughCode)
 	require.NotNil(t, mask5xx.ResponseCode)
 	require.Equal(t, 502, *mask5xx.ResponseCode)
 
 	maskAuth := byName["carpool-mask-auth"]
+	require.NotNil(t, maskAuth)
 	require.Equal(t, []int{401, 402, 403}, maskAuth.ErrorCodes)
+	require.False(t, maskAuth.PassthroughCode)
 	require.NotNil(t, maskAuth.ResponseCode)
 	require.Equal(t, 502, *maskAuth.ResponseCode)
 
 	mask429 := byName["carpool-mask-429"]
+	require.NotNil(t, mask429)
 	require.Equal(t, []int{429}, mask429.ErrorCodes)
 	require.True(t, mask429.PassthroughCode, "429 keeps upstream status code")
 
 	mask400 := byName["carpool-mask-400"]
+	require.NotNil(t, mask400)
 	require.Equal(t, []int{400, 404, 413, 422}, mask400.ErrorCodes)
 	require.True(t, mask400.PassthroughCode, "4xx request errors keep upstream status code")
 }

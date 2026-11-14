@@ -1,10 +1,11 @@
 # Sub2API 拼车（GPT Pro 20X 车主/车友）定制说明
 
-本仓库是 `Wei-Shaw/sub2api` 的拼车场景定制版。**核心结论：上游源码已内置全部所需能力，
-不需要改动任何 Go/前端代码**——定制内容是一个种子迁移 + 这份说明。
+本仓库是 `Wei-Shaw/sub2api` 的拼车场景定制版。核心能力来自上游内置实现，并在此基础上
+补充了**种子迁移 + 少量后端防护补丁**（空响应体错误透传、Responses `instructions` 与末尾
+`system`/`developer` 关键词拦截），前端代码零改动。
 
 - 定制种子：`backend/migrations/251_carpool_seed.sql`（服务启动时自动执行，幂等）
-- 种子合法性测试：`backend/migrations/251_carpool_seed_test.go`（`go test ./migrations/`）
+- 种子与补丁测试：`backend/migrations/251_carpool_seed_test.go`、`backend/internal/service/carpool_keyword_bypass_test.go`、`backend/internal/handler/carpool_passthrough_empty_body_test.go`
 
 ## 一、能力对照（你提的需求 → 上游实现）
 
@@ -13,8 +14,8 @@
 | 车友看限额/过期时间 | API Key 自带 `quota/quota_used/expires_at` + 5h/1d/7d 滚动窗口限流；用户面板 `/api/v1/keys`、`/usage/dashboard/*`、`/user/api-keys/:id/usage/daily` 全部现成 | 无需改动 |
 | 车友看使用日志 | 用户端用量列表 `/api/v1/usage` 现成；错误请求页 `/api/v1/usage/errors` 受 `allow_user_view_error_requests` 开关控制（fail-closed，且已脱敏白名单视图） | 种子设为 `false`：车友看不到上游错误明细 |
 | 车主添加渠道（标准 API） | 账号体系同时支持 `oauth`（Codex OAuth 等）与 `apikey`（标准 API 接口）两类，管理后台「账号管理」直接添加 | 无需改动 |
-| 上游报错伪装 | `ErrorPassthroughService` 兜底规则：命中后用 `custom_message` 改写文案，`response_code` 改写状态码；上游真实错误只进车主的 ops 运维看板（存储时已脱敏凭据字段） | 种子预置 4 条全平台兜底规则 |
-| 违规内容前置过滤、不发上游 | `ContentModerationService`（pre_block + keyword_blocking_mode=keyword_only）：本地关键词同步拦截，命中即 403，**不调用任何外部审核 API、不发上游请求** | 种子预置初始关键词表，车主可在管理后台增删 |
+| 上游报错伪装 | `ErrorPassthroughService` 兜底规则：命中后用 `custom_message` 改写文案，`response_code` 改写状态码；上游真实错误只进车主的 ops 运维看板（存储时已脱敏凭据字段） | 种子预置 4 条全平台兜底规则 + handler 支持空响应体命中状态码规则 |
+| 违规内容前置过滤、不发上游 | `ContentModerationService`（pre_block + keyword_blocking_mode=keyword_only）：本地关键词同步拦截，命中即 403，**不调用任何外部审核 API、不发上游请求** | 种子预置初始关键词表 + 本地关键词补充覆盖 `instructions` 与末尾 `system`/`developer` 项 |
 | 车友违规治理 | 关键词命中写入 `content_moderation_logs`；可选自动封号（`auto_ban_enabled` + 阈值） | 种子默认只拦不封，车主可开 |
 
 ## 二、部署
@@ -49,13 +50,17 @@ docker compose logs -f sub2api
 ```bash
 # 后端（Go 1.27+）：在 backend/ 下
 make build        # 或 go build ./cmd/server
-# 前端（Node 24+）：在 frontend/ 下
-npm ci && npm run build
+# 前端（Node 24+，使用 pnpm 9）：在 frontend/ 下
+corepack enable
+pnpm install --frozen-lockfile && pnpm run build
 ```
 
 产物部署后首次启动会自动跑全部 SQL 迁移（含 251 种子）。
 
 ### 验证种子已生效
+
+> 注意：251 号种子采用 `ON CONFLICT (key) DO NOTHING` / `WHERE NOT EXISTS` 写入，
+> 只会补全缺失项，不会覆盖老实例中管理员已经手工保存过的配置。
 
 启动后用管理员登录，检查：
 
@@ -111,21 +116,31 @@ OpenAI 兼容端点，并把 `keyword_blocking_mode` 调回 `keyword_and_api`—
 
 ## 四、与上游同步
 
-定制只有两个新增文件，rebase 上游 main 不会有冲突：
+定制包含以下新增与微调文件，rebase 上游 `main` 时仅需留意 4 个 Go 源码小改点：
 
-```
-backend/migrations/251_carpool_seed.sql
-backend/migrations/251_carpool_seed_test.go
-```
+- 新增文件：
+  - `CARPOOL.md`
+  - `backend/migrations/251_carpool_seed.sql`
+  - `backend/migrations/251_carpool_seed_test.go`
+  - `backend/internal/service/carpool_keyword_bypass_test.go`
+  - `backend/internal/handler/carpool_passthrough_empty_body_test.go`
+- 修改文件：
+  - `backend/cmd/server/VERSION`
+  - `backend/internal/handler/openai_gateway_handler.go`（`applyOpenAIFailoverPassthroughRule` 允许空响应体命中状态码规则）
+  - `backend/internal/handler/gateway_handler.go`（failover 耗尽透传允许空响应体）
+  - `backend/internal/handler/gemini_v1beta_handler.go`（Gemini failover 耗尽透传允许空响应体）
+  - `backend/internal/service/content_moderation_input.go`（`extractContentModerationKeywordText` 补充扫描 Responses `instructions` 与末尾 `system`/`developer` 项）
 
 > 注意：迁移文件有 SHA256 校验。如果未来你手工改了已在线上环境执行过的 251 号种子，
 > 会触发 checksum mismatch；正确做法是改关键词走管理后台（settings 表），或新增 252 号迁移。
 
 ## 五、已知边界
 
-- 关键词匹配只作用于**最后一条用户消息**（Anthropic/OpenAI/Gemini/Responses/Images
-  协议均已覆盖），历史上下文中的关键词不拦——上游设计如此，避免误伤。
-- 400 类确定性错误默认保留状态码（客户端需要知道参数错在哪）。若想连 400 也完全
-  统一成 502，在后台把 carpool-mask-400 的「透传状态码」关掉并填 502 即可。
-- 流式请求中上游**已开始输出后**的中断无法伪装（SSE 已发出 200），种子规则只覆盖
-  响应头之前的失败——这也是上游所有反代的一致行为。
+- 关键词提取与匹配边界：
+  - 历史上下文、以及以 `assistant`/`tool`/`function_call_output` 结尾的 Agent 工具循环轮次不会触发关键词拦截（保留上游设计，避免工具循环误伤）。
+  - 本地关键词已覆盖最新一轮 `user` 消息、Responses `instructions`（非工具循环时）及紧随 `user` 后的末尾 `system`/`developer` 项；匹配为大小写不敏感的子串匹配（`strings.Contains`），在后台追加短关键词时注意避免误伤正常语义。
+- 上游报错伪装边界：
+  - 400 类确定性错误默认保留状态码（客户端需要知道参数错在哪）。若想连 400 也完全统一成 502，在后台把 `carpool-mask-400` 的「透传状态码」关掉并填 502 即可。
+  - 流式请求中上游**已开始输出后**的中断无法伪装（SSE 已发出 200），种子规则只覆盖响应头之前的失败——这也是上游所有反代的一致行为。
+  - 空响应体且带 HTTP 状态码的上游失败现已可命中按状态码匹配的规则；但无 HTTP 状态码的网络超时/连接断开仍不会命中状态码规则。
+  - OpenAI 凭据/访问态拒绝、过载降级（`IsOpenAICapacityShed`）、兼容模型不存在 400 以及 `cyber_policy` 硬阻断会在透传规则之前返回；Responses WebSocket 模式则使用内置脱敏关闭文案，不读取 `error_passthrough_rules`。

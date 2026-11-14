@@ -3692,7 +3692,7 @@ func (h *OpenAIGatewayHandler) applyOpenAIFailoverPassthroughRule(
 	responseBody []byte,
 	streamStarted bool,
 ) bool {
-	if h.errorPassthroughService == nil || statusCode <= 0 || len(responseBody) == 0 {
+	if h.errorPassthroughService == nil || statusCode <= 0 {
 		return false
 	}
 	rule := h.errorPassthroughService.MatchRule("openai", statusCode, responseBody)
@@ -3708,6 +3708,8 @@ func (h *OpenAIGatewayHandler) applyOpenAIFailoverPassthroughRule(
 	msg := service.ExtractUpstreamErrorMessage(responseBody)
 	if !rule.PassthroughBody && rule.CustomMessage != nil {
 		msg = *rule.CustomMessage
+	} else if strings.TrimSpace(msg) == "" {
+		_, _, msg = h.mapUpstreamError(statusCode)
 	}
 
 	if rule.SkipMonitoring {

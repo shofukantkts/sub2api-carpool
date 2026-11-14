@@ -1927,8 +1927,8 @@ func (h *GatewayHandler) handleFailoverExhausted(c *gin.Context, failoverErr *se
 		return
 	}
 
-	// 先检查透传规则
-	if h.errorPassthroughService != nil && len(responseBody) > 0 {
+	// 先检查透传规则（允许空响应体命中纯状态码规则）
+	if h.errorPassthroughService != nil && statusCode > 0 {
 		if rule := h.errorPassthroughService.MatchRule(platform, statusCode, responseBody); rule != nil {
 			// 确定响应状态码
 			respCode := statusCode
@@ -1940,6 +1940,8 @@ func (h *GatewayHandler) handleFailoverExhausted(c *gin.Context, failoverErr *se
 			msg := service.ExtractUpstreamErrorMessage(responseBody)
 			if !rule.PassthroughBody && rule.CustomMessage != nil {
 				msg = *rule.CustomMessage
+			} else if strings.TrimSpace(msg) == "" {
+				_, _, msg = h.mapUpstreamError(statusCode)
 			}
 
 			if rule.SkipMonitoring {

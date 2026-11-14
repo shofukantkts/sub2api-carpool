@@ -9,10 +9,11 @@
 --      ContentModerationService.Check 命中并返回 403，不产生任何上游调用，
 --      也不依赖任何外部审核 API（无需配置 api_keys）。
 --   3. 上游报错伪装走 ErrorPassthroughService 兜底规则：所有平台命中后，
---      客户端只看到统一的 502 upstream_error 文案，真实上游错误只留在
---      车主的管理端运维看板里。
---   4. 全部语句幂等（ON CONFLICT DO NOTHING / 条件 UPDATE），可在已有
---      实例上重复执行；ON CONFLICT 表示不覆盖管理员已有的手工配置。
+--      5xx 与 401/402/403 统一改写为 502 通用文案，429 与 400 类保留原状态码并
+--      改写文案；真实上游错误只留在车主的管理端运维看板里。
+--   4. 全部语句幂等（settings 使用 ON CONFLICT DO NOTHING；error_passthrough_rules
+--      在 name 上无唯一约束，故使用 WHERE NOT EXISTS 按 name 防重），可在已有
+--      实例上重复执行且不覆盖管理员已有的手工配置。
 
 -- ---------------------------------------------------------------------------
 -- 1. 风控中心总开关（车友场景默认开启）
@@ -59,10 +60,10 @@ VALUES (
   "record_non_hits": false,
   "pre_hash_check_enabled": false,
   "blocked_keywords": [
-    "child sexual", "csam", "cp资源", "幼女", "未成年性行为",
-    "制作炸弹", "制毒", "合成毒品", "冰毒制作", "芬太尼合成",
+    "child sexual", "csam", "儿童色情", "幼女", "未成年性行为",
+    "制作炸弹", "制毒教程", "毒品制造", "合成毒品", "冰毒制作", "芬太尼合成",
     "生物武器", "基因编辑病毒", "病原体改造", "细菌战", "炭疽培养",
-    "渗透入侵教程", "拿站教程", "ddos攻击", "肉鸡", "爆破跑库",
+    "渗透入侵教程", "拿站教程", "ddos攻击", "抓肉鸡", "僵尸网络", "爆破跑库",
     "勒索病毒部署", "盗号木马编写", "银行卡四件套", "洗钱通道",
     "枪支买卖", "弹药购买", "人体器官交易", "人口贩卖",
     "自杀教程", "自残方法",
@@ -88,59 +89,70 @@ ON CONFLICT (key) DO NOTHING;
 -- ErrorPassthroughRule 表（backend/internal/model/error_passthrough_rule.go）：
 --   - platforms='[]'  → 匹配所有平台（openai/anthropic/gemini/antigravity/...）
 --   - match_mode=any + error_codes  → 仅按状态码匹配
---   - passthrough_code=false + response_code=502 → 统一改写为 502
+--   - passthrough_code=false + response_code=502 → 将 5xx/鉴权类改写为 502；
+--     429 与 400 类设 passthrough_code=true 保留原状态码，仅改写文案
 --   - passthrough_body=false + custom_message → 永不透传上游真实报错文案
 --   - skip_monitoring=false → 车主运维看板仍记录真实上游错误（含脱敏 body），
 --     车友端永远只看到 custom_message。
 -- 优先级数字越小越先匹配；多条规则覆盖常见上游故障类别。
+-- 注意：error_passthrough_rules 表在 name 上没有 UNIQUE 约束，不能依赖
+-- ON CONFLICT DO NOTHING 防重，必须用 WHERE NOT EXISTS 保证幂等。
 INSERT INTO error_passthrough_rules (
     name, enabled, priority, error_codes, keywords, match_mode,
     platforms, passthrough_code, response_code, passthrough_body,
     custom_message, skip_monitoring, description, updated_at
 )
-VALUES
-    (
-        'carpool-mask-5xx',
-        TRUE, 10,
-        '[500,502,503,504,529]'::jsonb, '[]'::jsonb, 'any',
-        '[]'::jsonb,
-        FALSE, 502, FALSE,
-        '上游服务暂时不可用，请稍后重试；若持续失败请联系车主。',
-        FALSE,
-        '上游 5xx/过载 → 统一 502 通用文案',
-        NOW()
-    ),
-    (
-        'carpool-mask-429',
-        TRUE, 10,
-        '[429]'::jsonb, '[]'::jsonb, 'any',
-        '[]'::jsonb,
-        TRUE, NULL, FALSE,
-        '当前时段用车需求较高，已达上游速率限制，请稍后重试。',
-        FALSE,
-        '上游 429 → 保留 429 状态码但改写文案',
-        NOW()
-    ),
-    (
-        'carpool-mask-auth',
-        TRUE, 10,
-        '[401,402,403]'::jsonb, '[]'::jsonb, 'any',
-        '[]'::jsonb,
-        FALSE, 502, FALSE,
-        '上游通道维护中，请稍后重试。',
-        FALSE,
-        '上游凭据/账单类错误 → 502，绝不暴露车主账号状态',
-        NOW()
-    ),
-    (
-        'carpool-mask-400',
-        TRUE, 20,
-        '[400,404,413,422]'::jsonb, '[]'::jsonb, 'any',
-        '[]'::jsonb,
-        TRUE, NULL, FALSE,
-        '请求被上游拒绝：请检查模型名、参数格式或请求体大小后重试。',
-        FALSE,
-        '确定性请求错误 → 保留状态码，改写为不泄露上游细节的通用文案',
-        NOW()
-    )
-ON CONFLICT DO NOTHING;
+SELECT
+    v.name, v.enabled, v.priority, v.error_codes, v.keywords, v.match_mode,
+    v.platforms, v.passthrough_code, v.response_code, v.passthrough_body,
+    v.custom_message, v.skip_monitoring, v.description, NOW()
+FROM (
+    VALUES
+        (
+            'carpool-mask-5xx',
+            TRUE, 10,
+            '[500,502,503,504,529]'::jsonb, '[]'::jsonb, 'any',
+            '[]'::jsonb,
+            FALSE, 502, FALSE,
+            '上游服务暂时不可用，请稍后重试；若持续失败请联系车主。',
+            FALSE,
+            '上游 5xx/过载 → 统一 502 通用文案'
+        ),
+        (
+            'carpool-mask-429',
+            TRUE, 10,
+            '[429]'::jsonb, '[]'::jsonb, 'any',
+            '[]'::jsonb,
+            TRUE, NULL::integer, FALSE,
+            '当前时段用车需求较高，已达上游速率限制，请稍后重试。',
+            FALSE,
+            '上游 429 → 保留 429 状态码但改写文案'
+        ),
+        (
+            'carpool-mask-auth',
+            TRUE, 10,
+            '[401,402,403]'::jsonb, '[]'::jsonb, 'any',
+            '[]'::jsonb,
+            FALSE, 502, FALSE,
+            '上游通道维护中，请稍后重试。',
+            FALSE,
+            '上游凭据/账单类错误 → 502，绝不暴露车主账号状态'
+        ),
+        (
+            'carpool-mask-400',
+            TRUE, 20,
+            '[400,404,413,422]'::jsonb, '[]'::jsonb, 'any',
+            '[]'::jsonb,
+            TRUE, NULL::integer, FALSE,
+            '请求被上游拒绝：请检查模型名、参数格式或请求体大小后重试。',
+            FALSE,
+            '确定性请求错误 → 保留状态码，改写为不泄露上游细节的通用文案'
+        )
+) AS v (
+    name, enabled, priority, error_codes, keywords, match_mode,
+    platforms, passthrough_code, response_code, passthrough_body,
+    custom_message, skip_monitoring, description
+)
+WHERE NOT EXISTS (
+    SELECT 1 FROM error_passthrough_rules existing WHERE existing.name = v.name
+);
