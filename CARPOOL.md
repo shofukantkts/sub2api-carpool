@@ -139,6 +139,7 @@ OpenAI 兼容端点，并把 `keyword_blocking_mode` 调回 `keyword_and_api`—
   - `backend/internal/handler/gateway_handler_chat_completions.go`（Anthropic/兼容组 `/v1/chat/completions` failover 耗尽优先匹配透传规则；仅发心跳后补发错误帧与 `[DONE]`）
   - `backend/internal/handler/gemini_v1beta_handler.go`（Gemini failover 耗尽透传允许空响应体）
   - `backend/internal/handler/security_audit_helper.go`（全局拦截重复 JSON 键，杜绝解析差异绕过）
+  - `backend/internal/handler/setting_handler.go`（`/api/v1/settings/public` 剥离 `-carpool` 版本后缀，确保普通用户视角与上游一致）
   - `backend/internal/service/content_moderation.go`、`backend/internal/service/content_moderation_input.go`（新增 Embeddings 与 Alpha Search 协议；拦截 Embeddings 整数 token 数组输入；关键词扫描所有客户端可控的 `system`/`developer`/`user` 文本、Responses `instructions`、Anthropic 顶层 `system`、Gemini `systemInstruction`/`system_instruction`；语义审核仍保持最新 `user` 行为）
   - `backend/internal/service/openai_embeddings.go`、`backend/internal/handler/openai_embeddings.go`（非 failover 错误优先匹配透传规则，未命中时统一 502 兜底伪装并记录 ops 真实错误）
   - `backend/internal/service/openai_alpha_search.go`、`backend/internal/handler/openai_alpha_search.go`（独立 Alpha Search 与 Responses fallback 非 failover 错误透传规则与未命中统一 502 兜底伪装）

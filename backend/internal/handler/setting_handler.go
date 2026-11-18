@@ -97,7 +97,7 @@ func (h *SettingHandler) GetPublicSettings(c *gin.Context) {
 		MCPEnabled:                          settings.MCPEnabled,
 		PaymentEnabled:                      settings.PaymentEnabled,
 		PaymentBalanceDisabled:              settings.PaymentBalanceDisabled,
-		Version:                             h.version,
+		Version:                             publicDisplayVersion(h.version),
 		ServerTimezone:                      timezone.Name(),
 		ServerUTCOffset:                     timezone.UTCOffset(),
 		BalanceLowNotifyEnabled:             settings.BalanceLowNotifyEnabled,
@@ -158,4 +158,16 @@ func publicLoginAgreementDocumentsToDTO(items []service.LoginAgreementDocument) 
 		})
 	}
 	return result
+}
+
+// publicDisplayVersion strips any custom "-carpool..." suffix so public
+// settings and non-admin UI views match upstream version formatting
+// (e.g. "0.2.22-carpool.1" -> "0.2.22"). Admin-only system version APIs
+// continue to report the full build version.
+func publicDisplayVersion(version string) string {
+	trimmed := strings.TrimSpace(version)
+	if idx := strings.Index(strings.ToLower(trimmed), "-carpool"); idx >= 0 {
+		return trimmed[:idx]
+	}
+	return trimmed
 }
