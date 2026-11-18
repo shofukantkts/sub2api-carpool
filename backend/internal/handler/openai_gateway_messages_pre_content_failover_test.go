@@ -313,9 +313,10 @@ func TestOpenAIMessagesNonStreamFailedFrameExhaustedAppliesRule(t *testing.T) {
 	requireFailedFrameRuleJSON(t, rec)
 }
 
-// A failover triggered by an HTTP status keeps the built-in exhaustion mapping:
-// no passthrough rule is looked up for it.
-func TestOpenAIMessagesHTTPStatusFailoverExhaustedIgnoresPassthroughRule(t *testing.T) {
+// Carpool customization: HTTP-status failovers on OpenAI-backed Anthropic
+// Messages also apply error_passthrough_rules so upstream errors can be
+// uniformly masked instead of falling back to built-in upstream wording.
+func TestOpenAIMessagesHTTPStatusFailoverExhaustedAppliesPassthroughRule(t *testing.T) {
 	rec, upstream := serveMessagesScenario(t, preContentFailoverScenario{
 		accounts:    preContentAccounts(1),
 		passthrough: newFailedFrameCodeRule("rate_limit_exceeded"),
@@ -331,6 +332,8 @@ func TestOpenAIMessagesHTTPStatusFailoverExhaustedIgnoresPassthroughRule(t *test
 	body := rec.Body.String()
 	t.Logf("status=%d body=%q", rec.Code, body)
 	require.Equal(t, 1, upstream.calls(), "body: %q", body)
-	require.NotEqual(t, http.StatusTeapot, rec.Code, "body: %q", body)
-	require.Equal(t, "Upstream service temporarily unavailable", gjson.Get(body, "error.message").String(), "body: %q", body)
+	require.Equal(t, http.StatusTeapot, rec.Code, "body: %q", body)
+	require.Equal(t, "error", gjson.Get(body, "type").String(), "body: %q", body)
+	require.Equal(t, "upstream_error", gjson.Get(body, "error.type").String(), "body: %q", body)
+	require.Equal(t, "Rate limit reached for gpt-5.4", gjson.Get(body, "error.message").String(), "body: %q", body)
 }
